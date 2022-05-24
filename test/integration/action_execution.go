@@ -85,6 +85,7 @@ var _ = Describe("Action Executor ", func() {
 
 	Describe("executing action move pod", func() {
 		It("should result in new pod on target node", func() {
+			framework.Failf("fail on purpose!")
 			dep, err := createDeployResource(kubeClient, depSingleContainerWithResources(namespace, "", 1, false, false, false))
 			framework.ExpectNoError(err, "Error creating test resources")
 
