@@ -7,9 +7,10 @@ import (
 	"time"
 
 	"github.com/golang/glog"
+	osclient "github.com/openshift/client-go/apps/clientset/versioned"
 	machinev1beta1api "github.com/openshift/machine-api-operator/pkg/apis/machine/v1beta1"
 	capiclient "github.com/openshift/machine-api-operator/pkg/generated/clientset/versioned"
-	policyv1alpha1 "github.com/turbonomic/turbo-crd/api/v1alpha1"
+	policyv1alpha1 "github.com/turbonomic/turbo-policy/api/v1alpha1"
 	api "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -35,6 +36,9 @@ const (
 	machineSetNodePoolPrefix = "machineset"
 	// Expiration of cached pod controller info.
 	defaultCacheTTL = 12 * time.Hour
+	// TODO: When we have an actual user scenario, find out the version the user has and
+	//  add support for multiple cluster-api versions if need be.
+	clusterAPIGroupVersion = "machine.openshift.io/v1beta1"
 )
 
 var (
@@ -59,6 +63,7 @@ type ClusterScraperInterface interface {
 	GetResourcesPaginated(resource schema.GroupVersionResource, itemsPerPage int) ([]unstructured.Unstructured, error)
 	GetMachineSetToNodesMap(nodes []*api.Node) map[string][]*api.Node
 	GetAllTurboSLOScalings() ([]policyv1alpha1.SLOHorizontalScale, error)
+	GetAllTurboCVSScalings() ([]policyv1alpha1.ContainerVerticalScale, error)
 	GetAllTurboPolicyBindings() ([]policyv1alpha1.PolicyBinding, error)
 	GetAllGitOpsConfigurations() ([]gitopsv1alpha1.GitOps, error)
 	UpdateGitOpsConfigCache()
@@ -67,9 +72,10 @@ type ClusterScraperInterface interface {
 type ClusterScraper struct {
 	*client.Clientset
 	RestConfig              *restclient.Config
-	caClient                *capiclient.Clientset
+	CApiClient              *capiclient.Clientset
 	capiNamespace           string
 	DynamicClient           dynamic.Interface
+	OsClient                *osclient.Clientset
 	ControllerRuntimeClient runtimeclient.Client
 	cache                   turbostore.ITurboCache
 	GitOpsConfigCache       map[string][]*gitopsv1alpha1.Configuration
@@ -77,23 +83,21 @@ type ClusterScraper struct {
 }
 
 func NewClusterScraper(restConfig *restclient.Config, kclient *client.Clientset, dynamicClient dynamic.Interface,
-	rtClient runtimeclient.Client, capiEnabled bool, caClient *capiclient.Clientset, capiNamespace string) *ClusterScraper {
-	clusterScraper := &ClusterScraper{
+	rtClient runtimeclient.Client, osClient *osclient.Clientset, caClient *capiclient.Clientset, capiNamespace string) *ClusterScraper {
+	return &ClusterScraper{
 		Clientset:               kclient,
 		RestConfig:              restConfig,
 		DynamicClient:           dynamicClient,
+		OsClient:                osClient,
 		ControllerRuntimeClient: rtClient,
+		// Nullable
+		CApiClient:    caClient,
+		capiNamespace: capiNamespace,
 		// Create cache with expiration duration as defaultCacheTTL, which means the cached data will be cleaned up after
 		// defaultCacheTTL.
 		cache:             turbostore.NewTurboCache(defaultCacheTTL).Cache,
 		GitOpsConfigCache: make(map[string][]*gitopsv1alpha1.Configuration),
 	}
-
-	if capiEnabled {
-		clusterScraper.caClient = caClient
-		clusterScraper.capiNamespace = capiNamespace
-	}
-	return clusterScraper
 }
 
 func (s *ClusterScraper) GetNamespaces() ([]*api.Namespace, error) {
@@ -150,7 +154,7 @@ func (s *ClusterScraper) GetAllNodes() ([]*api.Node, error) {
 
 func (s *ClusterScraper) GetMachineSetToNodesMap(allNodes []*api.Node) map[string][]*api.Node {
 	machineSetToNodes := make(map[string][]*api.Node)
-	if s.caClient == nil {
+	if s.CApiClient == nil {
 		return machineSetToNodes
 	}
 	// Get the list of machine sets in the cluster
@@ -198,7 +202,7 @@ func findNode(nodeName string, nodes []*api.Node) *api.Node {
 }
 
 func (s *ClusterScraper) getCApiMachineSets() *machinev1beta1api.MachineSetList {
-	machineSetList, err := s.caClient.MachineV1beta1().MachineSets(s.capiNamespace).List(context.TODO(), metav1.ListOptions{})
+	machineSetList, err := s.CApiClient.MachineV1beta1().MachineSets(s.capiNamespace).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		glog.Errorf("Error retrieving machinesets from cluster: %v", err)
 		return nil
@@ -208,7 +212,7 @@ func (s *ClusterScraper) getCApiMachineSets() *machinev1beta1api.MachineSetList 
 }
 
 func (s *ClusterScraper) getCApiMachinesFiltered(machinesetName string, listOptions metav1.ListOptions) []machinev1beta1api.Machine {
-	machineList, err := s.caClient.MachineV1beta1().Machines(s.capiNamespace).List(context.TODO(), listOptions)
+	machineList, err := s.CApiClient.MachineV1beta1().Machines(s.capiNamespace).List(context.TODO(), listOptions)
 	if err != nil {
 		glog.Errorf("Error retrieving machines for machineset %s from cluster: %v", machinesetName, err)
 		return nil
@@ -325,11 +329,20 @@ func (s *ClusterScraper) GetResourcesPaginated(
 }
 
 func (s *ClusterScraper) GetKubernetesServiceID() (svcID string, err error) {
+	k8sServiceKey := util.K8sServiceKey(k8sDefaultNamespace, kubernetesServiceName)
+	if cachedSvcID, exists := s.cache.Get(k8sServiceKey); exists {
+		svcID = cachedSvcID.(string)
+		glog.V(4).Infof("Using cached service uid: %s for kubernetes service name: %s", svcID, kubernetesServiceName)
+		return
+	}
 	svc, err := s.CoreV1().Services(k8sDefaultNamespace).Get(context.TODO(), kubernetesServiceName, metav1.GetOptions{})
 	if err != nil {
 		return
 	}
 	svcID = string(svc.UID)
+	glog.V(4).Infof("No cached service uid value found for kubernetes service name: %s", kubernetesServiceName)
+	//setting cache to never expire
+	s.cache.Set(k8sServiceKey, svcID, -1)
 	return
 }
 
@@ -378,15 +391,22 @@ func (s *ClusterScraper) GetPVCs(namespace string, opts metav1.ListOptions) ([]*
 // A pod can have its labels changed on the fly without being restarted, causing its controller to be changed as well.
 // This is very unlikely but still possible. This can be detected when the cache entry expires in defaultCacheTTL.
 func (s *ClusterScraper) UpdatePodControllerCache(
-	pods []*api.Pod, controllers map[string]*repository.K8sController) {
+	pods []*api.Pod, controllers map[string]*repository.K8sController) map[string]string {
 	existing := 0
 	added := 0
 	bare := 0
 	custom := 0
+	podToControllerMap := make(map[string]string)
 	for _, pod := range pods {
 		podControllerInfoKey := util.PodControllerInfoKey(pod)
-		if _, exists := s.cache.Get(podControllerInfoKey); exists {
+		if o, exists := s.cache.Get(podControllerInfoKey); exists {
 			// Pod's controller info already exists in the cache
+			if oTyped, ok := o.(util.OwnerInfo); ok {
+				podToControllerMap[util.PodKeyFunc(pod)] = ownerControllerUniqueName(oTyped.Kind, pod.Namespace, oTyped.Name)
+			} else {
+				//simply skip this controller info
+				continue
+			}
 			existing++
 			continue
 		}
@@ -403,6 +423,7 @@ func (s *ClusterScraper) UpdatePodControllerCache(
 			// Could be custom controller. We do not bulk process custom controller.
 			glog.V(3).Infof("Skip updating controller %v/%v for pod %v/%v: controller not cached.",
 				ownerInfo.Kind, ownerInfo.Name, pod.Namespace, pod.Name)
+			podToControllerMap[util.PodKeyFunc(pod)] = ownerControllerUniqueName(ownerInfo.Kind, pod.Namespace, ownerInfo.Name)
 			custom++
 			continue
 		}
@@ -414,17 +435,25 @@ func (s *ClusterScraper) UpdatePodControllerCache(
 				// Found it
 				gpOwnerInfo.Containers = controller.Containers
 				s.cache.Set(podControllerInfoKey, gpOwnerInfo, 0)
+				podToControllerMap[util.PodKeyFunc(pod)] = ownerControllerUniqueName(gpOwnerInfo.Kind, pod.Namespace, gpOwnerInfo.Name)
 				added++
 				continue
 			}
 		}
 		ownerInfo.Containers = controller.Containers
 		s.cache.Set(podControllerInfoKey, ownerInfo, 0)
+		podToControllerMap[util.PodKeyFunc(pod)] = ownerControllerUniqueName(ownerInfo.Kind, pod.Namespace, ownerInfo.Name)
 		added++
 	}
+
 	glog.V(2).Infof("Finished updating pod controller cache."+
 		" Total pod scanned: %d, cached: %d, newly added: %d, bare pods: %d, pods with custom controllers: %d",
 		len(pods), existing, added, bare, custom)
+	return podToControllerMap
+}
+
+func ownerControllerUniqueName(kind, ns, name string) string {
+	return kind + "/" + ns + "/" + name
 }
 
 // GetPodControllerInfo gets grandParent (parent's parent) information of a pod: kind, name, uid
@@ -536,6 +565,15 @@ func (s *ClusterScraper) GetAllTurboSLOScalings() ([]policyv1alpha1.SLOHorizonta
 	return sloScaleList.Items, nil
 }
 
+// GetAllTurboCVSScalings gets the custom ContainerVerticalScale resource from all namespaces
+func (s *ClusterScraper) GetAllTurboCVSScalings() ([]policyv1alpha1.ContainerVerticalScale, error) {
+	cvsScaleList := &policyv1alpha1.ContainerVerticalScaleList{}
+	if err := s.ControllerRuntimeClient.List(context.TODO(), cvsScaleList, &listOptions); err != nil {
+		return nil, err
+	}
+	return cvsScaleList.Items, nil
+}
+
 // GetAllTurboPolicyBindings gets the custom PolicyBinding resource from all namespaces
 func (s *ClusterScraper) GetAllTurboPolicyBindings() ([]policyv1alpha1.PolicyBinding, error) {
 	policyBindingList := &policyv1alpha1.PolicyBindingList{}
@@ -571,4 +609,22 @@ func (s *ClusterScraper) UpdateGitOpsConfigCache() {
 	s.GitOpsConfigCacheLock.Lock()
 	defer s.GitOpsConfigCacheLock.Unlock()
 	s.GitOpsConfigCache = gitOpsConfigCache
+}
+
+// IsClusterAPIEnabled checks whether the machine API is enabled for this cluster.
+// This API can be installed or unsintalled anytime, so this function may return true or false accordingly at runtime.
+func (s *ClusterScraper) IsClusterAPIEnabled() bool {
+	if s.CApiClient == nil {
+		return false
+	}
+	serviceString := fmt.Sprintf("ClusterAPI service \"%s\"", clusterAPIGroupVersion)
+	_, err := s.Clientset.Discovery().ServerResourcesForGroupVersion(clusterAPIGroupVersion)
+	// Ideally notFound is the error type which would definitively say that the resource
+	// is unavailable, but we also don't know if the functionality would work if we get some
+	// other error here. We thus treat all errors as problematic.
+	if err != nil {
+		glog.Infof("%s is not available: %v", serviceString, err)
+		return false
+	}
+	return true
 }

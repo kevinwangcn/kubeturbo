@@ -36,6 +36,8 @@ const (
 	// TODO: [Deprecated] Use TurboControllableAnnotation instead
 	TurboMonitorAnnotation      string = "kubeturbo.io/monitored"
 	TurboControllableAnnotation string = "kubeturbo.io/controllable"
+	defaultNamespace            string = "default"
+	defaultServiceName          string = "kubernetes"
 )
 
 type PodEvent struct {

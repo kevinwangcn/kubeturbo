@@ -8,17 +8,21 @@ import (
 
 	"github.com/golang/glog"
 
-	"github.com/turbonomic/kubeturbo/pkg/discovery/repository"
-	"github.com/turbonomic/kubeturbo/pkg/discovery/util"
+	api "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 
+	"github.com/turbonomic/turbo-go-sdk/pkg/proto"
+
+	"github.com/turbonomic/kubeturbo/pkg/cluster"
+	"github.com/turbonomic/kubeturbo/pkg/discovery/configs"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/dtofactory"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/metrics"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/monitoring"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/monitoring/types"
+	"github.com/turbonomic/kubeturbo/pkg/discovery/repository"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/stitching"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/task"
-	"github.com/turbonomic/turbo-go-sdk/pkg/proto"
-	api "k8s.io/api/core/v1"
+	"github.com/turbonomic/kubeturbo/pkg/discovery/util"
 )
 
 const (
@@ -27,6 +31,7 @@ const (
 )
 
 type k8sDiscoveryWorkerConfig struct {
+	probeConfig *configs.ProbeConfig
 	// a collection of all configs for building different monitoring clients.
 	// key: monitor type; value: monitor worker config.
 	monitoringSourceConfigs map[types.MonitorType][]monitoring.MonitorWorkerConfig
@@ -40,7 +45,7 @@ type k8sDiscoveryWorkerConfig struct {
 	commodityConfig *dtofactory.CommodityConfig
 }
 
-func NewK8sDiscoveryWorkerConfig(sType stitching.StitchingPropertyType, timeoutSec, metricSamples int) *k8sDiscoveryWorkerConfig {
+func NewK8sDiscoveryWorkerConfig(probeConfig *configs.ProbeConfig, sType stitching.StitchingPropertyType, timeoutSec, metricSamples int) *k8sDiscoveryWorkerConfig {
 	var monitoringWorkerTimeout time.Duration
 	if timeoutSec < minTimeoutSec {
 		glog.Warningf("Invalid discovery timeout %v, set it to %v", timeoutSec, minTimeoutSec)
@@ -54,6 +59,7 @@ func NewK8sDiscoveryWorkerConfig(sType stitching.StitchingPropertyType, timeoutS
 		glog.Infof("Discovery timeout is %v", monitoringWorkerTimeout)
 	}
 	return &k8sDiscoveryWorkerConfig{
+		probeConfig:             probeConfig,
 		stitchingPropertyType:   sType,
 		monitoringSourceConfigs: make(map[types.MonitorType][]monitoring.MonitorWorkerConfig),
 		monitoringWorkerTimeout: monitoringWorkerTimeout,
@@ -104,13 +110,15 @@ type k8sDiscoveryWorker struct {
 	stitchingManager *stitching.StitchingManager
 
 	taskChan chan *task.Task
+
+	k8sClusterScraper *cluster.ClusterScraper
 }
 
 // Create new instance of k8sDiscoveryWorker.
 // Also creates instances of MonitoringWorkers for each MonitorType.
 func NewK8sDiscoveryWorker(config *k8sDiscoveryWorkerConfig, wid string, globalMetricSink *metrics.EntityMetricSink,
 	isFullDiscoveryWorker bool) (*k8sDiscoveryWorker, error) {
-	// id := uuid.NewUUID().String()
+	k8sClusterScraper := config.probeConfig.ClusterScraper
 	if len(config.monitoringSourceConfigs) == 0 {
 		return nil, errors.New("no monitoring source config found in config")
 	}
@@ -152,6 +160,7 @@ func NewK8sDiscoveryWorker(config *k8sDiscoveryWorkerConfig, wid string, globalM
 		globalMetricSink:      globalMetricSink,
 		stitchingManager:      stitchingManager,
 		taskChan:              make(chan *task.Task),
+		k8sClusterScraper:     k8sClusterScraper,
 	}, nil
 }
 
@@ -363,7 +372,8 @@ func (worker *k8sDiscoveryWorker) buildEntityDTOs(currTask *task.Task) ([]*proto
 	var entityDTOs []*proto.EntityDTO
 	var notReadyNodes []string
 	// Build entity DTOs for nodes
-	nodeDTOs, notReadyNodes := worker.buildNodeDTOs([]*api.Node{currTask.Node()})
+	nodeDTOs, notReadyNodes := worker.buildNodeDTOs([]*api.Node{currTask.Node()}, currTask.NodesPods(),
+		currTask.HostnameSpreadWorkloads(), currTask.OtherSpreadPods(), currTask.PodstoControllers())
 
 	glog.V(3).Infof("Worker %s built %d node DTOs.", worker.id, len(nodeDTOs))
 	if len(nodeDTOs) == 0 {
@@ -393,7 +403,8 @@ func (worker *k8sDiscoveryWorker) buildEntityDTOs(currTask *task.Task) ([]*proto
 	return entityDTOs, podEntities, sidecarContainerSpecs, podWithVolumes, notReadyNodes, mirrorPodUids
 }
 
-func (worker *k8sDiscoveryWorker) buildNodeDTOs(nodes []*api.Node) ([]*proto.EntityDTO, []string) {
+func (worker *k8sDiscoveryWorker) buildNodeDTOs(nodes []*api.Node, nodesPods map[string][]string,
+	hostnameSpreadWorkloads sets.String, otherSpreadPods sets.String, podsToControllers map[string]string) ([]*proto.EntityDTO, []string) {
 	// SetUp nodeName to nodeId mapping
 	stitchingManager := worker.stitchingManager
 	for _, node := range nodes {
@@ -406,7 +417,8 @@ func (worker *k8sDiscoveryWorker) buildNodeDTOs(nodes []*api.Node) ([]*proto.Ent
 	}
 	// Build entity DTOs for nodes
 	return dtofactory.NewNodeEntityDTOBuilder(worker.sink, stitchingManager).
-		WithClusterKeyInjected(worker.config.clusterKeyInjected).BuildEntityDTOs(nodes)
+		WithClusterKeyInjected(worker.config.clusterKeyInjected).
+		BuildEntityDTOs(nodes, nodesPods, hostnameSpreadWorkloads, otherSpreadPods, podsToControllers)
 }
 
 // Build DTOs for running pods
@@ -418,8 +430,9 @@ func (worker *k8sDiscoveryWorker) buildPodDTOs(currTask *task.Task) ([]*proto.En
 		glog.Errorf("Failed to build pod DTOs: cluster summary object is null for worker %s", worker.id)
 		return nil, nil, nil, nil
 	}
+
 	runningPodDTOs, pendingPodDTOs, podsWithVolumes, mirrorPodUids := dtofactory.
-		NewPodEntityDTOBuilder(worker.sink, worker.stitchingManager).
+		NewPodEntityDTOBuilder(worker.sink, worker.stitchingManager, worker.k8sClusterScraper).
 		// Node providers
 		WithNodeNameUIDMap(cluster.NodeNameUIDMap).
 		// Quota providers
@@ -435,6 +448,10 @@ func (worker *k8sDiscoveryWorker) buildPodDTOs(currTask *task.Task) ([]*proto.En
 		WithClusterKeyInjected(worker.config.clusterKeyInjected).
 		// map of mirror pods to daemon flags
 		WithMirrorPodToDaemonMap(cluster.MirrorPodToDaemonMap).
+		WithPodsWithAffinities(currTask.PodsWithAffinities()).
+		WithHostnameSpreadPods(currTask.HostnameSpreadPods()).
+		WithOtherSpreadPods(currTask.OtherSpreadPods()).
+		WithPodsToControllers(currTask.PodstoControllers()).
 		BuildEntityDTOs()
 
 	var podDTOs []*proto.EntityDTO
@@ -464,7 +481,7 @@ func (worker *k8sDiscoveryWorker) buildAppDTOs(
 	var result []*proto.EntityDTO
 	var podEntities []*repository.KubePod
 	applicationEntityDTOBuilder := dtofactory.
-		NewApplicationEntityDTOBuilder(worker.sink, cluster.PodClusterIDToServiceMap)
+		NewApplicationEntityDTOBuilder(worker.sink, cluster.PodClusterIDToServiceMap, worker.k8sClusterScraper)
 
 	for _, pod := range runningPods {
 		kubeNode := cluster.NodeMap[pod.Spec.NodeName]

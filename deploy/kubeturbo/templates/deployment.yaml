@@ -58,6 +58,10 @@ spec:
           {{- end }}
           {{- if .Values.image.imagePullSecret }}
           - --busybox-image-pull-secret={{ .Values.image.imagePullSecret }}
+          - --cpufreqgetter-image-pull-secret={{ .Values.image.imagePullSecret }}
+          {{- end }}
+          {{- if .Values.image.cpufreqgetterRepository }}
+          - --cpufreqgetter-image={{ .Values.image.cpufreqgetterRepository }}
           {{- end }}
           {{- if .Values.args.busyboxExcludeNodeLabels }}
           - --cpufreq-job-exclude-node-labels={{ .Values.args.busyboxExcludeNodeLabels }}
@@ -67,6 +71,9 @@ spec:
           {{- end }}
           {{- if .Values.args.pre16k8sVersion }}
           - --k8sVersion=1.5
+          {{- end }}
+          {{- if not .Values.args.cleanupSccImpersonationResources }}
+          - --cleanup-scc-impersonation-resources={{ .Values.args.cleanupSccImpersonationResources }}
           {{- end }}
           resources:
 {{ toYaml .Values.resources | indent 12 }}
@@ -87,7 +94,7 @@ spec:
         secret:
           defaultMode: 420
           optional: true
-          secretName: {{ .Values.restAPIConfig.turbonomicCredentialsSecretName | quote }}
+          secretName: {{ .Values.restAPIConfig.turbonomicCredentialsSecretName | default "turbonomic-credentials" | quote }}
       - name: varlog
         emptyDir: {}
       restartPolicy: Always

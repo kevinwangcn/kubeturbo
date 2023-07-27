@@ -3,13 +3,17 @@ package executor
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/golang/glog"
 	"github.com/turbonomic/kubeturbo/pkg/resourcemapping"
 
+	osv1 "github.com/openshift/api/apps/v1"
+	osclient "github.com/openshift/client-go/apps/clientset/versioned"
 	apicorev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -36,6 +40,7 @@ import (
 type k8sController interface {
 	get(name string) (*k8sControllerSpec, error)
 	update(updatedSpec *k8sControllerSpec) error
+	revert() error
 }
 
 // k8sControllerSpec defines a set of objects that we want to update:
@@ -50,6 +55,7 @@ type k8sControllerSpec struct {
 
 type kubeClients struct {
 	typedClient *typedClient.Clientset
+	osClient    *osclient.Clientset
 	dynClient   dynamic.Interface
 	// TODO: remove the need of this as we have dynClient already
 	dynNamespacedClient dynamic.ResourceInterface
@@ -58,8 +64,9 @@ type kubeClients struct {
 type parentController struct {
 	clients               kubeClients
 	obj                   *unstructured.Unstructured
+	backupObj             *unstructured.Unstructured
 	name                  string
-	ormClient             *resourcemapping.ORMClient
+	ormClient             *resourcemapping.ORMClientManager
 	managerApp            *repository.K8sApp
 	gitConfig             gitops.GitConfig
 	k8sClusterId          string
@@ -96,6 +103,7 @@ func (c *parentController) get(name string) (*k8sControllerSpec, error) {
 	}
 
 	c.obj = obj
+	c.backupObj = c.obj.DeepCopy()
 	int32Replicas := int32(replicas)
 	return &k8sControllerSpec{
 		replicas:       &int32Replicas,
@@ -113,8 +121,6 @@ func (c *parentController) update(updatedSpec *k8sControllerSpec) error {
 	if err != nil {
 		return fmt.Errorf("error converting pod spec to unstructured pod spec for %s %s: %v", kind, objName, err)
 	}
-
-	origControllerObj := c.obj.DeepCopy()
 	if kind != util.KindDaemonSet { // daemonsets do not have replica field
 		if err := unstructured.SetNestedField(c.obj.Object, replicaVal, "spec", "replicas"); err != nil {
 			return fmt.Errorf("error setting replicas into unstructured %s %s: %v", kind, objName, err)
@@ -154,14 +160,43 @@ func (c *parentController) update(updatedSpec *k8sControllerSpec) error {
 		if c.ormClient == nil {
 			return fmt.Errorf("failed to execute action with nil ORMClient")
 		}
-		err = c.ormClient.Update(origControllerObj, c.obj, ownerInfo)
+		resourcePaths, err := getResourcePath(kind, updatedSpec)
+		if err != nil {
+			return fmt.Errorf("unable to get resource paths: %v", err)
+		}
+		ownerResources, err := c.ormClient.GetOwnerResourcesForSource(c.obj, ownerInfo, resourcePaths)
+		if err != nil {
+			return fmt.Errorf("unable to get owner resources: %v", err)
+		}
+		return c.ormClient.UpdateOwners(c.obj, ownerInfo, ownerResources)
 	} else {
+		start := time.Now()
 		_, err = c.clients.dynNamespacedClient.Update(context.TODO(), c.obj, metav1.UpdateOptions{})
+		if err != nil {
+			return err
+		}
+
+		if utilfeature.DefaultFeatureGate.Enabled(features.ForceDeploymentConfigRollout) {
+			needsRollout, typedDC, err := c.shouldRolloutDeploymentConfig()
+			if err != nil {
+				return err
+			}
+			if needsRollout {
+				err = c.rolloutDeploymentConfig(typedDC)
+				if err != nil {
+					return err
+				}
+			}
+		}
+
 		if utilfeature.DefaultFeatureGate.Enabled(features.AllowIncreaseNsQuota4Resizing) {
-			err4Waiting := c.waitForAllNewReplicasToBeCreated(c.obj.GetName())
+			err4Waiting := c.waitForAllNewReplicasToBeCreated(c.obj.GetName(), start)
 			if err4Waiting != nil {
 				glog.V(2).Infof("Get error while waiting for the new replicas to be created for the workload controller %s/%s:%v", c.obj.GetNamespace(), c.obj.GetName(), err4Waiting)
-				if hasWarningEvent, warningInfo := c.getLatestWarningEvents(c.obj.GetNamespace(), c.obj.GetName()); hasWarningEvent {
+				if strings.Contains(err4Waiting.Error(), "forbidden") {
+					return util.NewSkipRetryError(err4Waiting.Error()) // this will skip the retry in updateWithRetry
+				}
+				if hasWarningEvent, warningInfo := c.getLatestWarningEventsSinceUpdate(c.obj.GetNamespace(), c.obj.GetName(), start); hasWarningEvent {
 					return fmt.Errorf(warningInfo)
 				}
 				return err4Waiting
@@ -172,12 +207,87 @@ func (c *parentController) update(updatedSpec *k8sControllerSpec) error {
 	return err
 }
 
+func (c *parentController) revert() error {
+	oldPodSpecUnstructured, found, err := unstructured.NestedFieldCopy(c.backupObj.Object, "spec", "template", "spec")
+	if err != nil || !found {
+		return err
+	}
+	currentObj, err := c.clients.dynNamespacedClient.Get(context.TODO(), c.obj.GetName(), metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	currentPodSpecUnstructured, found, err := unstructured.NestedFieldCopy(currentObj.Object, "spec", "template", "spec")
+	if err != nil || !found {
+		return err
+	}
+	if reflect.DeepEqual(oldPodSpecUnstructured, currentPodSpecUnstructured) {
+		glog.V(4).Infof("There is no change between the original pod spec and the current one for the workload controller %s/%s, no need to revert", c.obj.GetNamespace(), c.obj.GetName())
+		return nil
+	}
+	if err := unstructured.SetNestedField(currentObj.Object, oldPodSpecUnstructured, "spec", "template", "spec"); err != nil {
+		return err
+	}
+	if _, err = c.clients.dynNamespacedClient.Update(context.TODO(), currentObj, metav1.UpdateOptions{}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *parentController) rolloutDeploymentConfig(dc *osv1.DeploymentConfig) error {
+	// This will fail if the DC is already paused because of whatever reason
+	name := c.obj.GetName()
+	ns := c.obj.GetNamespace()
+	glog.V(3).Infof("Starting (Instantiating) the deploymentconfig %s/%s rollout", ns, name)
+	deployRequest := osv1.DeploymentRequest{Name: name, Latest: true, Force: true}
+	_, err := c.clients.osClient.AppsV1().DeploymentConfigs(ns).
+		Instantiate(context.TODO(), name, &deployRequest, metav1.CreateOptions{})
+	if err == nil {
+		glog.V(3).Infof("Rolled out (Instantiated) the deploymentconfig %s/%s", ns, name)
+	}
+
+	return err
+}
+
+func (c *parentController) shouldRolloutDeploymentConfig() (bool, *osv1.DeploymentConfig, error) {
+	objName := c.obj.GetNamespace() + "/" + c.obj.GetName()
+	objKind := c.obj.GetKind()
+	if objKind != util.KindDeploymentConfig {
+		return false, nil, nil
+	}
+
+	typedDC := osv1.DeploymentConfig{}
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(c.obj.Object, &typedDC); err != nil {
+		return false, nil, fmt.Errorf("error converting unstructured %s %s to typed %s: %v", objKind, objName, objKind, err)
+	}
+
+	spec := typedDC.Spec
+	// if no triggers/empty triggers are set ||
+	// if only imageChange trigger and no other trigger is set
+	shouldRollout := (len(spec.Triggers) == 0) ||
+		(len(spec.Triggers) == 1 && spec.Triggers[0].Type == osv1.DeploymentTriggerOnImageChange)
+
+	if shouldRollout && spec.Paused {
+		glog.Errorf("%s %s needs manual rollout, but is paused. Aborting rollout.", objKind, objName)
+		return false, nil, fmt.Errorf("rollout aborted as %s %s needs manual rollout, but is paused", objKind, objName)
+	}
+
+	return shouldRollout, &typedDC, nil
+}
+
 // Wait for all of the new replicas to be created
-func (c *parentController) waitForAllNewReplicasToBeCreated(name string) error {
+func (c *parentController) waitForAllNewReplicasToBeCreated(name string, start time.Time) error {
 	return wait.Poll(DefaultRetrySleepInterval, DefaultWaitReplicaToBeScheduled, func() (bool, error) {
 		obj, errInternal := c.clients.dynNamespacedClient.Get(context.TODO(), name, metav1.GetOptions{})
 		if errInternal != nil {
 			return false, errInternal
+		}
+
+		if hasWarningEvent, warningInfo := c.getLatestWarningEventsSinceUpdate(c.obj.GetNamespace(), c.obj.GetName(), start); hasWarningEvent {
+			if strings.Contains(warningInfo, "forbidden") {
+				// if there is a forbidden error, return a error which will exit the meaningless waiting
+				glog.Errorf("Failed to create new replica for the workload controller %s/%s as there is a forbidden error: %s", c.obj.GetNamespace(), c.obj.GetName(), warningInfo)
+				return false, fmt.Errorf(warningInfo)
+			}
 		}
 
 		var replicas, updatedReplicas int64
@@ -210,7 +320,7 @@ func (c *parentController) waitForAllNewReplicasToBeCreated(name string) error {
 }
 
 // get the latest warning event for a workload controller
-func (c *parentController) getLatestWarningEvents(namespace, name string) (bool, string) {
+func (c *parentController) getLatestWarningEventsSinceUpdate(namespace, name string, start time.Time) (bool, string) {
 	// Get events that belong to the given workload controller
 	events, err := c.clients.typedClient.CoreV1().Events(namespace).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
@@ -219,7 +329,7 @@ func (c *parentController) getLatestWarningEvents(namespace, name string) (bool,
 	var latestEnt apicorev1.Event
 	visited := make(map[string]bool, 0)
 	for _, ent := range events.Items {
-		if ent.Type == apicorev1.EventTypeWarning && strings.HasPrefix(ent.InvolvedObject.Name, name) {
+		if ent.Type == apicorev1.EventTypeWarning && ent.CreationTimestamp.After(start) && strings.HasPrefix(ent.InvolvedObject.Name, name) {
 			if ent.CreationTimestamp.After(latestEnt.CreationTimestamp.Time) {
 				latestEnt = ent
 			}
@@ -328,4 +438,22 @@ func (c *parentController) GetGitOpsConfig(obj *unstructured.Unstructured) gitop
 	// No override was found. Return the default config.
 	glog.V(3).Infof("No GitOps configuration override found for [%v]. Using default configuration.", appName)
 	return c.gitConfig
+}
+
+// This gets all the resource paths for the containers from the controller spec for the supported controller types
+// resourcePath is similar for Deployment, StatefulSet and DaemonSet - "spec.template.spec.containers[?(@.name==“xxx”)].resources"
+func getResourcePath(controllerType string, k8sSpec *k8sControllerSpec) ([]string, error) {
+	var resourcePaths []string
+	switch controllerType {
+	case util.KindDeployment, util.KindDaemonSet, util.KindStatefulSet:
+		for _, container := range k8sSpec.podSpec.Containers {
+			resourcePath := ".spec.template.spec.containers[?(@.name==" + "\"" + container.Name + "\"" + ")].resources"
+			resourcePaths = append(resourcePaths, resourcePath)
+		}
+		glog.V(4).Infof("found resource paths for supported controller type: %v", controllerType)
+		return resourcePaths, nil
+		// TODO: we don't support any custom controllers currently, since when building podspec it resolves in unexpected controller type.
+		// default resource path for custome custroller - ".spec.containers[?(@.name=="xxxx")].resources"
+	}
+	return resourcePaths, fmt.Errorf("unsupported controller type: %v", controllerType)
 }

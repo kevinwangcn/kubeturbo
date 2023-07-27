@@ -28,7 +28,7 @@ debug-product: clean
 	env GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags $(LDFLAGS) -gcflags "-N -l" -o $(OUTPUT_DIR)/$(BINARY).debug ./cmd/kubeturbo
 
 build: clean
-	go build -ldflags $(LDFLAGS) ./cmd/kubeturbo
+	go build -ldflags $(LDFLAGS) -o $(OUTPUT_DIR)/$(BINARY) ./cmd/kubeturbo
 
 integration: clean
 	go test -c -o $(OUTPUT_DIR)/integration.test ./test/integration
@@ -65,3 +65,15 @@ fmtcheck:
 .PHONY: vet
 vet:
 	@go vet $(shell $(PACKAGES))
+
+PLATFORMS ?= linux/arm64,linux/amd64,linux/s390x,linux/ppc64le
+REPO_NAME ?= icr.io/cpopen/turbonomic
+.PHONY: multi-archs
+multi-archs:
+	env GOOS=${TARGETOS} GOARCH=${TARGETARCH} CGO_ENABLED=0 go build -ldflags $(LDFLAGS) -o $(OUTPUT_DIR)/$(BINARY) ./cmd/kubeturbo
+.PHONY: docker-buildx
+docker-buildx:
+	docker buildx create --name kubeturbo-builder
+	- docker buildx use kubeturbo-builder
+	- docker buildx build --platform=$(PLATFORMS) --label "git-commit=$(GIT_COMMIT)" --label "git-version=$(VERSION)" --provenance=false --push --tag $(REPO_NAME)/kubeturbo:$(VERSION) -f build/Dockerfile.multi-archs --build-arg VERSION=$(VERSION) .
+	docker buildx rm kubeturbo-builder

@@ -2,18 +2,19 @@ package worker
 
 import (
 	"fmt"
-	"github.com/turbonomic/kubeturbo/pkg/discovery/dtofactory"
-
 	"time"
+
+	api "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/golang/glog"
 	"github.com/turbonomic/kubeturbo/pkg/cluster"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/configs"
+	"github.com/turbonomic/kubeturbo/pkg/discovery/dtofactory"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/metrics"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/monitoring/types"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/repository"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/task"
-	api "k8s.io/api/core/v1"
 )
 
 type DispatcherConfig struct {
@@ -88,7 +89,7 @@ func (d *Dispatcher) Init(c *ResultCollector) {
 	// Create discovery workers
 	for i := 0; i < d.config.workerCount; i++ {
 		// Create the worker instance
-		workerConfig := NewK8sDiscoveryWorkerConfig(d.config.probeConfig.StitchingPropertyType, d.config.workerTimeoutSec, d.config.samples).
+		workerConfig := NewK8sDiscoveryWorkerConfig(d.config.probeConfig, d.config.probeConfig.StitchingPropertyType, d.config.workerTimeoutSec, d.config.samples).
 			WithClusterKeyInjected(d.config.clusterKeyInjected)
 		for _, mc := range d.config.probeConfig.MonitoringConfigs {
 			workerConfig.WithMonitoringWorkerConfig(mc)
@@ -108,7 +109,7 @@ func (d *Dispatcher) InitSamplingDiscoveryWorkers() {
 	// Sampling discovery only scrape kubelet which is very lightweight, so use 2 times of the full discovery worker count
 	for i := 0; i < 2*d.config.workerCount; i++ {
 		// Timeout of each sampling discovery worker is the given samplingIntervalSec to avoid goroutine pile up
-		workerConfig := NewK8sDiscoveryWorkerConfig("", d.config.samplingIntervalSec, d.config.samples)
+		workerConfig := NewK8sDiscoveryWorkerConfig(d.config.probeConfig, "", d.config.samplingIntervalSec, d.config.samples)
 		for _, mc := range d.config.probeConfig.MonitoringConfigs {
 			// Only monitor kubelet to collect additional resource usage data samples
 			if mc.GetMonitoringSource() == types.KubeletSource {
@@ -134,7 +135,8 @@ func (d *Dispatcher) RegisterWorker(worker *k8sDiscoveryWorker) {
 
 // Create Task objects for discovery and monitoring for each node, and the pods and containers on that node
 // Dispatch the task to the pool, task will be picked by the k8sDiscoveryWorker
-func (d *Dispatcher) Dispatch(nodes []*api.Node, cluster *repository.ClusterSummary) int {
+func (d *Dispatcher) Dispatch(nodes []*api.Node, nodesPods map[string][]string, podsWithAffinities,
+	otherSpreadPods sets.String, hostnameSpreadWorkloads map[string]sets.String, cluster *repository.ClusterSummary) int {
 	go func() {
 		for _, node := range nodes {
 			runningPods := cluster.GetRunningPodsOnNode(node)
@@ -143,7 +145,12 @@ func (d *Dispatcher) Dispatch(nodes []*api.Node, cluster *repository.ClusterSumm
 				WithNode(node).
 				WithRunningPods(runningPods).
 				WithPendingPods(pendingPods).
-				WithCluster(cluster)
+				WithCluster(cluster).
+				WithNodesPods(nodesPods).
+				WithPodsWithAffinities(podsWithAffinities).
+				WithHostnameSpreadWorkloads(hostnameSpreadWorkloads).
+				WithOtherSpreadPods(otherSpreadPods).
+				WithPodsToControllers(cluster.PodToControllerMap)
 			glog.V(2).Infof("Dispatching task %v", currTask)
 			d.assignTask(currTask)
 		}

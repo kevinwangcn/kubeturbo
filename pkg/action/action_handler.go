@@ -7,7 +7,6 @@ import (
 
 	"github.com/golang/glog"
 
-	"github.com/openshift/machine-api-operator/pkg/generated/clientset/versioned"
 	"github.com/turbonomic/kubeturbo/pkg/action/executor"
 	"github.com/turbonomic/kubeturbo/pkg/action/util"
 	"github.com/turbonomic/kubeturbo/pkg/cluster"
@@ -36,6 +35,7 @@ type turboActionType struct {
 var (
 	turboActionPodProvision     = turboActionType{proto.ActionItemDTO_PROVISION, proto.EntityDTO_CONTAINER_POD}
 	turboActionPodSuspend       = turboActionType{proto.ActionItemDTO_SUSPEND, proto.EntityDTO_CONTAINER_POD}
+	turboActionControllerScale  = turboActionType{proto.ActionItemDTO_HORIZONTAL_SCALE, proto.EntityDTO_WORKLOAD_CONTROLLER}
 	turboActionPodMove          = turboActionType{proto.ActionItemDTO_MOVE, proto.EntityDTO_CONTAINER_POD}
 	turboActionContainerResize  = turboActionType{proto.ActionItemDTO_RIGHT_SIZE, proto.EntityDTO_CONTAINER}
 	turboActionMachineProvision = turboActionType{proto.ActionItemDTO_PROVISION, proto.EntityDTO_VIRTUAL_MACHINE}
@@ -45,13 +45,12 @@ var (
 
 type ActionHandlerConfig struct {
 	clusterScraper *cluster.ClusterScraper
-	cApiClient     *versioned.Clientset
 	kubeletClient  *kubeletclient.KubeletClient
 	StopEverything chan struct{}
 	sccAllowedSet  map[string]struct{}
 	cAPINamespace  string
 	// ormClient provides the capability to update the corresponding CR for an Operator managed resource.
-	ormClient               *resourcemapping.ORMClient
+	ormClient               *resourcemapping.ORMClientManager
 	failVolumePodMoves      bool
 	updateQuotaToAllowMoves bool
 	readinessRetryThreshold int
@@ -59,8 +58,9 @@ type ActionHandlerConfig struct {
 	k8sClusterId            string
 }
 
-func NewActionHandlerConfig(cApiNamespace string, cApiClient *versioned.Clientset, kubeletClient *kubeletclient.KubeletClient,
-	clusterScraper *cluster.ClusterScraper, sccSupport []string, ormClient *resourcemapping.ORMClient,
+func NewActionHandlerConfig(cApiNamespace string, kubeletClient *kubeletclient.KubeletClient,
+	clusterScraper *cluster.ClusterScraper, sccSupport []string,
+	ORMClientManager *resourcemapping.ORMClientManager,
 	failVolumePodMoves, updateQuotaToAllowMoves bool, readinessRetryThreshold int, gitConfig gitops.GitConfig, clusterId string) *ActionHandlerConfig {
 	sccAllowedSet := make(map[string]struct{})
 	for _, sccAllowed := range sccSupport {
@@ -74,8 +74,7 @@ func NewActionHandlerConfig(cApiNamespace string, cApiClient *versioned.Clientse
 		StopEverything:          make(chan struct{}),
 		sccAllowedSet:           sccAllowedSet,
 		cAPINamespace:           cApiNamespace,
-		cApiClient:              cApiClient,
-		ormClient:               ormClient,
+		ormClient:               ORMClientManager,
 		failVolumePodMoves:      failVolumePodMoves,
 		updateQuotaToAllowMoves: updateQuotaToAllowMoves,
 		readinessRetryThreshold: readinessRetryThreshold,
@@ -133,7 +132,7 @@ func NewActionHandler(config *ActionHandlerConfig) *ActionHandler {
 // As action executor is stateless, they can be safely reused.
 func (h *ActionHandler) registerActionExecutors() {
 	c := h.config
-	ae := executor.NewTurboK8sActionExecutor(c.clusterScraper, c.cApiClient, h.podManager,
+	ae := executor.NewTurboK8sActionExecutor(c.clusterScraper, h.podManager,
 		h.config.ormClient, c.gitConfig, c.k8sClusterId)
 
 	reScheduler := executor.NewReScheduler(ae, c.sccAllowedSet, c.failVolumePodMoves,
@@ -144,6 +143,7 @@ func (h *ActionHandler) registerActionExecutors() {
 	horizontalScaler := executor.NewHorizontalScaler(ae)
 	h.actionExecutors[turboActionPodProvision] = horizontalScaler
 	h.actionExecutors[turboActionPodSuspend] = horizontalScaler
+	h.actionExecutors[turboActionControllerScale] = horizontalScaler
 
 	containerResizer := executor.NewContainerResizer(ae, c.kubeletClient, c.sccAllowedSet)
 	h.actionExecutors[turboActionContainerResize] = containerResizer
@@ -151,14 +151,11 @@ func (h *ActionHandler) registerActionExecutors() {
 	controllerResizer := executor.NewWorkloadControllerResizer(ae, c.kubeletClient, c.sccAllowedSet, h.lockMap)
 	h.actionExecutors[turboActionControllerResize] = controllerResizer
 
-	// Only register the actions when API client is non-nil and cluster-api is available.
-	if executor.IsClusterAPIEnabled(c.cApiClient, c.clusterScraper.Clientset) {
-		machineScaler := executor.NewMachineActionExecutor(c.cAPINamespace, ae)
-		h.actionExecutors[turboActionMachineProvision] = machineScaler
-		h.actionExecutors[turboActionMachineSuspend] = machineScaler
-	} else {
-		glog.V(1).Info("the Cluster API is unavailable")
-	}
+	// Register machine scaler anyway as machine API may be enabled or disabled at runtime, but the registration
+	// only happens at kubeturbo start up time. During actual action execution, machine API will be checked again.
+	machineScaler := executor.NewMachineActionExecutor(c.cAPINamespace, ae)
+	h.actionExecutors[turboActionMachineProvision] = machineScaler
+	h.actionExecutors[turboActionMachineSuspend] = machineScaler
 }
 
 // Implement ActionExecutorClient interface defined in Go SDK.
@@ -259,6 +256,9 @@ func (h *ActionHandler) getRelatedPod(actionItem *proto.ActionItemDTO) (*api.Pod
 		podEntity = actionItem.GetHostedBySE()
 	case turboActionPodMove, turboActionPodProvision, turboActionPodSuspend:
 		podEntity = actionItem.GetTargetSE()
+	case turboActionControllerScale:
+		// pod horizontal scale (provision/suspension) action was merged into controller. No need for pod information.
+		return nil, nil
 	case turboActionMachineProvision, turboActionMachineSuspend:
 		// This branch is not called right now. Implement for the sake of completeness.
 		return nil, nil

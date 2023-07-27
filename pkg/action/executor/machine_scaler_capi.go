@@ -5,16 +5,17 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/golang/glog"
 	machinev1beta1 "github.com/openshift/machine-api-operator/pkg/apis/machine/v1beta1"
 	"github.com/openshift/machine-api-operator/pkg/generated/clientset/versioned"
 	"github.com/openshift/machine-api-operator/pkg/generated/clientset/versioned/typed/machine/v1beta1"
-	discoveryutil "github.com/turbonomic/kubeturbo/pkg/discovery/util"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/golang/glog"
+	"github.com/turbonomic/kubeturbo/pkg/cluster"
+	"github.com/turbonomic/kubeturbo/pkg/discovery/util"
 )
 
 // ActionType describes the current phase of processing the Action request.
@@ -22,9 +23,6 @@ type ActionType string
 
 // These are the valid Action types.
 const (
-	// TODO: When we have an actual user scenario, find out the version the user has and
-	// add support for multiple cluster-api versions if need be.
-	clusterAPIGroupVersion                = "machine.openshift.io/v1beta1"
 	DeleteNodeAnnotation                  = "machine.openshift.io/cluster-api-delete-machine"
 	ProvisionAction            ActionType = "Provision"
 	SuspendAction              ActionType = "Suspend"
@@ -47,24 +45,6 @@ type k8sClusterApi struct {
 	machineSet v1beta1.MachineSetInterface
 }
 
-// IsClusterAPIEnabled checks whether cluster API is in fact enabled.
-func IsClusterAPIEnabled(cApiClient *versioned.Clientset, kubeClient *kubernetes.Clientset) bool {
-	if cApiClient == nil {
-		return false
-	}
-
-	serviceString := fmt.Sprintf("ClusterAPI service \"%s\"", clusterAPIGroupVersion)
-	_, err := kubeClient.Discovery().ServerResourcesForGroupVersion(clusterAPIGroupVersion)
-	// Ideally notFound is the error type which would definitively say that the resource
-	// is unavailable, but we also don't know if the functionality would work if we get some
-	// other error here. We thus treat all errors as problematic.
-	if err != nil {
-		glog.Warningf("%s is not available: %v", serviceString, err)
-		return false
-	}
-	return true
-}
-
 // identifyManagingMachine returns the Machine that manages the given node.
 // An error is returned if the Machine is not found or the node does not exist.
 func (client *k8sClusterApi) identifyManagingMachine(nodeName string) (*machinev1beta1.Machine, error) {
@@ -78,10 +58,10 @@ func (client *k8sClusterApi) identifyManagingMachine(nodeName string) (*machinev
 			return machine, nil
 		}
 
-		return nil, fmt.Errorf("No node or a machine found named %s: %v ", machineName, err)
+		return nil, fmt.Errorf("no node or a machine found named %s: %v ", machineName, err)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("Error retrieving node %s: %v", nodeName, err)
+		return nil, fmt.Errorf("error retrieving node %s: %v", nodeName, err)
 	}
 
 	// List all machines and match the node.
@@ -225,7 +205,7 @@ func (controller *machineSetController) identifyDiff(list1, list2 *machinev1beta
 				break
 			}
 		}
-		if found == true {
+		if found {
 			continue
 		} else {
 			return &machine1
@@ -340,6 +320,7 @@ func (controller *machineSetController) waitForMachineDeprovisioning(machine *ma
 
 // waitForState Is the function that allows to wait for a specific state, or until it times out.
 func (controller *machineSetController) waitForState(stateDesc string, f stateCheck, args ...interface{}) error {
+	glog.V(4).Infof("Waiting for state: '%s'", stateDesc)
 	for i := 0; i < operationMaxWaits; i++ {
 		ok, err := f(args...)
 		if err != nil {
@@ -347,6 +328,7 @@ func (controller *machineSetController) waitForState(stateDesc string, f stateCh
 		}
 		// We are done, return
 		if ok {
+			glog.V(4).Infof("Verified desired state: '%s'", stateDesc)
 			return nil
 		}
 		time.Sleep(operationWaitSleepInterval)
@@ -357,11 +339,15 @@ func (controller *machineSetController) waitForState(stateDesc string, f stateCh
 
 // Construct the controller
 func newController(namespace string, nodeName string, diff int32, actionType ActionType,
-	cApiClient *versioned.Clientset, kubeClient *kubernetes.Clientset) (Controller, *string, error) {
-	if cApiClient == nil {
+	clusterScraper *cluster.ClusterScraper,
+) (Controller, *string, error) {
+	// Check whether Cluster API is enabled.
+	if !clusterScraper.IsClusterAPIEnabled() {
 		return nil, nil, fmt.Errorf("no Cluster API available")
 	}
 	// Construct the API clients.
+	cApiClient := clusterScraper.CApiClient
+	kubeClient := clusterScraper.Clientset
 	client := &k8sClusterApi{
 		caClient:   cApiClient,
 		k8sClient:  kubeClient,
@@ -369,17 +355,14 @@ func newController(namespace string, nodeName string, diff int32, actionType Act
 		machine:    cApiClient.MachineV1beta1().Machines(namespace),
 		machineSet: cApiClient.MachineV1beta1().MachineSets(namespace),
 	}
-	// Check whether Cluster API is enabled.
-	if !IsClusterAPIEnabled(cApiClient, kubeClient) {
-		return nil, nil, fmt.Errorf("cluster API is not enabled for %s", nodeName)
-	}
 	// Identify managing machine.
 	machine, err := client.identifyManagingMachine(nodeName)
 	if err != nil {
-		err = fmt.Errorf("cannot identify machine: %v", err)
+		err = fmt.Errorf("cannot identify managing machine: %v", err)
 		return nil, nil, err
 	}
-	ownerInfo, ownerSet := discoveryutil.GetOwnerInfo(machine.OwnerReferences)
+	glog.V(3).Infof("Identified %s as managing machine for %v", machine.Name, nodeName)
+	ownerInfo, ownerSet := util.GetOwnerInfo(machine.OwnerReferences)
 	if !ownerSet {
 		return nil, nil, fmt.Errorf("ownerRef missing from machine %s which manages %s", machine.Name, nodeName)
 	}
@@ -401,6 +384,5 @@ func newController(namespace string, nodeName string, diff int32, actionType Act
 	}
 
 	request := &actionRequest{client, nodeName, diff, actionType}
-	return &machineSetController{request, machineSet, machine, machineList},
-		&ownerInfo.Name, nil
+	return &machineSetController{request, machineSet, machine, machineList}, &ownerInfo.Name, nil
 }

@@ -13,18 +13,19 @@ import (
 
 	"github.com/turbonomic/kubeturbo/pkg/discovery/metrics"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/util"
-	"github.com/turbonomic/turbo-crd/api/v1alpha1"
 	"github.com/turbonomic/turbo-go-sdk/pkg/proto"
+	"github.com/turbonomic/turbo-policy/api/v1alpha1"
 )
 
 // KubeCluster defines the Kubernetes cluster. This object is immutable between discoveries.
 // New discovery will bring in changes to the nodes and namespaces
 // Aggregate structure for nodes, namespaces and quotas
 type KubeCluster struct {
-	Name         string
-	Nodes        []*v1.Node
-	Pods         []*v1.Pod
-	NamespaceMap map[string]*KubeNamespace
+	Name              string
+	Nodes             []*v1.Node
+	Pods              []*v1.Pod
+	KubeNamespacesMap map[string]*v1.Namespace
+	NamespaceMap      map[string]*KubeNamespace
 	// Map of Service to Pod cluster Ids
 	Services map[*v1.Service][]string
 	// Map of Persistent Volumes to namespace qualified pod names with their
@@ -34,6 +35,8 @@ type KubeCluster struct {
 	// Map of namespace qualified pod name wrt to the volumes they mount.
 	// This map will not feature volumes which are not mounted by any pods.
 	PodToVolumesMap map[string][]MountedVolume
+	// Map of namespace qualified pod name to their cluster unique parent name
+	PodToControllerMap map[string]string
 
 	K8sAppToComponentMap map[K8sApp][]K8sAppComponent
 	ComponentToAppMap    map[K8sAppComponent][]K8sApp
@@ -63,6 +66,11 @@ func (kc *KubeCluster) WithPods(pods []*v1.Pod) *KubeCluster {
 
 func (kc *KubeCluster) WithMachineSetToNodesMap(machineSetToNodesMap map[string][]*v1.Node) *KubeCluster {
 	kc.MachineSetToNodesMap = machineSetToNodesMap
+	return kc
+}
+
+func (kc *KubeCluster) WithPodToControllerMap(podToControllerMap map[string]string) *KubeCluster {
+	kc.PodToControllerMap = podToControllerMap
 	return kc
 }
 
@@ -588,7 +596,8 @@ func parseAllocationResourceValue(resource v1.ResourceName, allocationResourceTy
 }
 
 type TurboPolicy struct {
-	SLOHorizontalScale *v1alpha1.SLOHorizontalScale
+	SLOHorizontalScale     *v1alpha1.SLOHorizontalScale
+	ContainerVerticalScale *v1alpha1.ContainerVerticalScale
 }
 
 func NewTurboPolicy() *TurboPolicy {
@@ -597,6 +606,11 @@ func NewTurboPolicy() *TurboPolicy {
 
 func (p *TurboPolicy) WithSLOHorizontalScale(policy *v1alpha1.SLOHorizontalScale) *TurboPolicy {
 	p.SLOHorizontalScale = policy
+	return p
+}
+
+func (p *TurboPolicy) WithContainerVerticalScale(policy *v1alpha1.ContainerVerticalScale) *TurboPolicy {
+	p.ContainerVerticalScale = policy
 	return p
 }
 
@@ -637,6 +651,13 @@ func (b *TurboPolicyBinding) GetSLOHorizontalScaleSpec() *v1alpha1.SLOHorizontal
 		return nil
 	}
 	return &b.SLOHorizontalScale.Spec
+}
+
+func (b *TurboPolicyBinding) GetContainerVerticalScaleSpec() *v1alpha1.ContainerVerticalScaleSpec {
+	if b.ContainerVerticalScale == nil {
+		return nil
+	}
+	return &b.ContainerVerticalScale.Spec
 }
 
 func (b *TurboPolicyBinding) GetTargets() []v1alpha1.PolicyTargetReference {

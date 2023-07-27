@@ -23,16 +23,13 @@ type RegistrationConfig struct {
 	stitchingPropertyType stitching.StitchingPropertyType
 	vmPriority            int32
 	vmIsBase              bool
-	// cluster API
-	cAPIEnabled bool
 }
 
-func NewRegistrationClientConfig(pType stitching.StitchingPropertyType, p int32, isbase, cAPIEnabled bool) *RegistrationConfig {
+func NewRegistrationClientConfig(pType stitching.StitchingPropertyType, p int32, isbase bool) *RegistrationConfig {
 	return &RegistrationConfig{
 		stitchingPropertyType: pType,
 		vmPriority:            p,
 		vmIsBase:              isbase,
-		cAPIEnabled:           cAPIEnabled,
 	}
 }
 
@@ -44,7 +41,8 @@ type K8sRegistrationClient struct {
 }
 
 func NewK8sRegistrationClient(config *RegistrationConfig, targetConfig *configs.K8sTargetConfig,
-	accountValues []*proto.AccountValue, k8sSvcId string) *K8sRegistrationClient {
+	accountValues []*proto.AccountValue, k8sSvcId string,
+) *K8sRegistrationClient {
 	return &K8sRegistrationClient{
 		config:                 config,
 		targetConfig:           targetConfig,
@@ -157,13 +155,11 @@ func (rClient *K8sRegistrationClient) GetActionPolicy() []*proto.ActionPolicyDTO
 	nodePolicy := make(map[proto.ActionItemDTO_ActionType]proto.ActionPolicyDTO_ActionCapability)
 	nodePolicy[proto.ActionItemDTO_RIGHT_SIZE] = notSupported
 	nodePolicy[proto.ActionItemDTO_SCALE] = notSupported
-	if rClient.config.cAPIEnabled {
-		nodePolicy[proto.ActionItemDTO_PROVISION] = supported
-		nodePolicy[proto.ActionItemDTO_SUSPEND] = supported
-	} else {
-		nodePolicy[proto.ActionItemDTO_PROVISION] = recommend
-		nodePolicy[proto.ActionItemDTO_SUSPEND] = recommend
-	}
+
+	// node provision/suspend default is recommend.
+	// During Discovery, if cluster API is enabled (i.e. openshift), this will change to "supported"
+	nodePolicy[proto.ActionItemDTO_PROVISION] = recommend
+	nodePolicy[proto.ActionItemDTO_SUSPEND] = recommend
 
 	rClient.addActionPolicy(ab, node, nodePolicy)
 
@@ -200,8 +196,8 @@ func (rClient *K8sRegistrationClient) GetActionPolicy() []*proto.ActionPolicyDTO
 
 func (rClient *K8sRegistrationClient) addActionPolicy(ab *builder.ActionPolicyBuilder,
 	entity proto.EntityDTO_EntityType,
-	policies map[proto.ActionItemDTO_ActionType]proto.ActionPolicyDTO_ActionCapability) {
-
+	policies map[proto.ActionItemDTO_ActionType]proto.ActionPolicyDTO_ActionCapability,
+) {
 	for action, policy := range policies {
 		ab.WithEntityActions(entity, action, policy)
 	}
@@ -209,30 +205,59 @@ func (rClient *K8sRegistrationClient) addActionPolicy(ab *builder.ActionPolicyBu
 
 func (rClient *K8sRegistrationClient) GetActionMergePolicy() []*proto.ActionMergePolicyDTO {
 	glog.V(2).Infof("Begin to build Action Merge Policies")
-
-	actionMergeTarget := builder.NewActionDeDuplicateAndAggregationTargetBuilder().
+	// resize action
+	resizeActionMergeTarget := builder.NewActionDeDuplicateAndAggregationTargetBuilder().
 		DeDuplicatedBy(builder.NewActionAggregationTargetBuilder(proto.EntityDTO_CONTAINER_SPEC,
 			proto.ConnectedEntity_CONTROLLED_BY_CONNECTION)).
 		AggregatedBy(builder.NewActionAggregationTargetBuilder(proto.EntityDTO_WORKLOAD_CONTROLLER,
 			proto.ConnectedEntity_CONTROLLED_BY_CONNECTION))
 
-	actionMergeTarget2 := builder.NewActionDeDuplicateAndAggregationTargetBuilder().
+	resizeActionMergeTarget2 := builder.NewActionDeDuplicateAndAggregationTargetBuilder().
 		DeDuplicatedBy(builder.NewActionAggregationTargetBuilder(proto.EntityDTO_CONTAINER_SPEC,
 			proto.ConnectedEntity_CONTROLLED_BY_CONNECTION)).
 		AggregatedBy(builder.NewActionAggregationTargetBuilder(proto.EntityDTO_WORKLOAD_CONTROLLER,
 			proto.ConnectedEntity_OWNS_CONNECTION))
 
-	containerResizeMerge := builder.NewResizeMergeSpecBuilder().
+	containerResizeMerge := builder.NewMergePolicyBuilder().
 		ForEntityType(proto.EntityDTO_CONTAINER).
 		ForCommodity(proto.CommodityDTO_VCPU).
 		ForCommodity(proto.CommodityDTO_VMEM).
 		ForCommodity(proto.CommodityDTO_VCPU_REQUEST).
 		ForCommodity(proto.CommodityDTO_VMEM_REQUEST).
-		DeDuplicateAndAggregateBy(actionMergeTarget).
-		DeDuplicateAndAggregateBy(actionMergeTarget2)
+		DeDuplicateAndAggregateBy(resizeActionMergeTarget).
+		DeDuplicateAndAggregateBy(resizeActionMergeTarget2)
+
+		// horizontal scale action
+	horizontalScaleActionMergeTarget := builder.NewActionAggregationTargetBuilder(proto.EntityDTO_WORKLOAD_CONTROLLER,
+		proto.ConnectedEntity_AGGREGATED_BY_CONNECTION)
+
+	containerPodDataDaemonSet := proto.EntityDTO_ContainerPodData{
+		ControllerData: &proto.EntityDTO_WorkloadControllerData{
+			ControllerType: &proto.EntityDTO_WorkloadControllerData_DaemonSetData{
+				DaemonSetData: &proto.EntityDTO_DaemonSetData{},
+			},
+		},
+	}
+
+	containerPodDataReplicaSet := proto.EntityDTO_ContainerPodData{
+		ControllerData: &proto.EntityDTO_WorkloadControllerData{
+			ControllerType: &proto.EntityDTO_WorkloadControllerData_ReplicaSetData{
+				ReplicaSetData: &proto.EntityDTO_ReplicaSetData{},
+			},
+		},
+	}
+
+	containerHorizontalScaleMerge := builder.NewMergePolicyBuilder().
+		ForEntityType(proto.EntityDTO_CONTAINER_POD).
+		ForCommodity(proto.CommodityDTO_RESPONSE_TIME).
+		ForCommodity(proto.CommodityDTO_TRANSACTION).
+		ForContainerPodDataExclusionFilter(&containerPodDataDaemonSet).
+		ForContainerPodDataExclusionFilter(&containerPodDataReplicaSet).
+		AggregateBy(horizontalScaleActionMergeTarget)
 
 	return builder.NewActionMergePolicyBuilder().
 		ForResizeAction(proto.EntityDTO_CONTAINER, containerResizeMerge).
+		ForHorizontalScaleAction(proto.EntityDTO_CONTAINER_POD, containerHorizontalScaleMerge).
 		Create()
 }
 
@@ -279,6 +304,7 @@ func (rClient *K8sRegistrationClient) newIdMetaData(etype proto.EntityDTO_Entity
 
 	return result
 }
+
 func (rClient *K8sRegistrationClient) GetTargetIdentifier() string {
 	if rClient.targetConfig.TargetIdentifier == "" {
 		glog.Warning("Cannot build default secure probe target, target identifier is not provided")

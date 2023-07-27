@@ -70,22 +70,27 @@ func (builder *workloadControllerDTOBuilder) BuildDTOs() ([]*proto.EntityDTO, er
 			entityDTOBuilder.Owns(containerSpecId)
 		}
 
-		// Create WorkloadControllerData to store controller type data
-		entityDTOBuilder.WorkloadControllerData(builder.createWorkloadControllerData(kubeController))
-
 		// WorkloadController cannot be provisioned or suspended by Turbonomic analysis
 		entityDTOBuilder.IsProvisionable(false)
 		entityDTOBuilder.IsSuspendable(false)
 
 		entityDTOBuilder.WithPowerState(proto.EntityDTO_POWERED_ON)
 		entityDTOBuilder.WithProperty(property.BuildWorkloadControllerNSProperty(kubeController.Namespace))
+
+		var replicas int32
 		if builder.clusterSummary != nil {
 			controller, found := builder.clusterSummary.ControllerMap[workloadControllerId]
 			if found {
 				entityDTOBuilder.WithProperties(property.BuildLabelAnnotationProperties(controller.Labels, controller.Annotations, detectors.AWWorkloadController))
-
+				if controller.Replicas != nil {
+					replicas = int32(*controller.Replicas)
+				}
 			}
 		}
+
+		// Create WorkloadControllerData to store controller type data
+		entityDTOBuilder.WorkloadControllerData(builder.createWorkloadControllerData(kubeController, replicas))
+
 		entityDTO, err := entityDTOBuilder.Create()
 		if err != nil {
 			glog.Errorf("failed to build WorkloadController[%s] entityDTO: %v", workloadControllerDisplayName, err)
@@ -177,67 +182,85 @@ func getActiveReplicaCount(kubeController *repository.KubeController) int32 {
 	return int32(replicaCount)
 }
 
-func (builder *workloadControllerDTOBuilder) createWorkloadControllerData(kubeController *repository.KubeController) *proto.EntityDTO_WorkloadControllerData {
-	controllerType := kubeController.ControllerType
-	replicaCount := getActiveReplicaCount(kubeController)
-	switch controllerType {
+// CreateWorkloadControllerDataByControllerType creates and returns a *proto.EntityDTO_WorkloadControllerData
+// based on the provided controller kind.
+//
+// The supported controller kinds are:
+//   - KindCronJob
+//   - KindDaemonSet
+//   - KindDeployment
+//   - KindJob
+//   - KindReplicaSet
+//   - KindReplicationController
+//   - KindStatefulSet
+//
+// If the provided kind does not match any known controller type, it returns CustomControllerData with its type specified.
+func CreateWorkloadControllerDataByControllerType(kind string) *proto.EntityDTO_WorkloadControllerData {
+	var data *proto.EntityDTO_WorkloadControllerData
+
+	switch kind {
 	case util.KindCronJob:
-		return &proto.EntityDTO_WorkloadControllerData{
+		data = &proto.EntityDTO_WorkloadControllerData{
 			ControllerType: &proto.EntityDTO_WorkloadControllerData_CronJobData{
 				CronJobData: &proto.EntityDTO_CronJobData{},
 			},
-			ReplicaCount: &replicaCount,
 		}
 	case util.KindDaemonSet:
-		return &proto.EntityDTO_WorkloadControllerData{
+		data = &proto.EntityDTO_WorkloadControllerData{
 			ControllerType: &proto.EntityDTO_WorkloadControllerData_DaemonSetData{
 				DaemonSetData: &proto.EntityDTO_DaemonSetData{},
 			},
-			ReplicaCount: &replicaCount,
 		}
 	case util.KindDeployment:
-		return &proto.EntityDTO_WorkloadControllerData{
+		data = &proto.EntityDTO_WorkloadControllerData{
 			ControllerType: &proto.EntityDTO_WorkloadControllerData_DeploymentData{
 				DeploymentData: &proto.EntityDTO_DeploymentData{},
 			},
-			ReplicaCount: &replicaCount,
 		}
 	case util.KindJob:
-		return &proto.EntityDTO_WorkloadControllerData{
+		data = &proto.EntityDTO_WorkloadControllerData{
 			ControllerType: &proto.EntityDTO_WorkloadControllerData_JobData{
 				JobData: &proto.EntityDTO_JobData{},
 			},
-			ReplicaCount: &replicaCount,
 		}
 	case util.KindReplicaSet:
-		return &proto.EntityDTO_WorkloadControllerData{
+		data = &proto.EntityDTO_WorkloadControllerData{
 			ControllerType: &proto.EntityDTO_WorkloadControllerData_ReplicaSetData{
 				ReplicaSetData: &proto.EntityDTO_ReplicaSetData{},
 			},
-			ReplicaCount: &replicaCount,
 		}
 	case util.KindReplicationController:
-		return &proto.EntityDTO_WorkloadControllerData{
+		data = &proto.EntityDTO_WorkloadControllerData{
 			ControllerType: &proto.EntityDTO_WorkloadControllerData_ReplicationControllerData{
 				ReplicationControllerData: &proto.EntityDTO_ReplicationControllerData{},
 			},
-			ReplicaCount: &replicaCount,
 		}
 	case util.KindStatefulSet:
-		return &proto.EntityDTO_WorkloadControllerData{
+		data = &proto.EntityDTO_WorkloadControllerData{
 			ControllerType: &proto.EntityDTO_WorkloadControllerData_StatefulSetData{
 				StatefulSetData: &proto.EntityDTO_StatefulSetData{},
 			},
-			ReplicaCount: &replicaCount,
 		}
 	default:
-		return &proto.EntityDTO_WorkloadControllerData{
+		data = &proto.EntityDTO_WorkloadControllerData{
 			ControllerType: &proto.EntityDTO_WorkloadControllerData_CustomControllerData{
 				CustomControllerData: &proto.EntityDTO_CustomControllerData{
-					CustomControllerType: &controllerType,
+					CustomControllerType: &kind,
 				},
 			},
-			ReplicaCount: &replicaCount,
 		}
 	}
+
+	return data
+}
+
+func (builder *workloadControllerDTOBuilder) createWorkloadControllerData(kubeController *repository.KubeController, replicas int32) *proto.EntityDTO_WorkloadControllerData {
+	controllerType := kubeController.ControllerType
+	data := CreateWorkloadControllerDataByControllerType(controllerType)
+
+	if data != nil {
+		data.ReplicaCount = &replicas
+	}
+
+	return data
 }

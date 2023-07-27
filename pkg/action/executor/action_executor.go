@@ -3,8 +3,6 @@ package executor
 import (
 	api "k8s.io/api/core/v1"
 
-	"github.com/openshift/machine-api-operator/pkg/generated/clientset/versioned"
-
 	"github.com/turbonomic/turbo-go-sdk/pkg/proto"
 
 	"github.com/turbonomic/kubeturbo/pkg/action/executor/gitops"
@@ -30,20 +28,19 @@ type TurboActionExecutor interface {
 
 type TurboK8sActionExecutor struct {
 	clusterScraper *cluster.ClusterScraper
-	cApiClient     *versioned.Clientset
 	podManager     util.IPodManager
-	ormClient      *resourcemapping.ORMClient
+	ormClient      *resourcemapping.ORMClientManager
 	gitConfig      gitops.GitConfig
 	k8sClusterId   string
 }
 
-func NewTurboK8sActionExecutor(clusterScraper *cluster.ClusterScraper, cApiClient *versioned.Clientset,
-	podManager util.IPodManager, ormSpec *resourcemapping.ORMClient, gitConfig gitops.GitConfig, clusterId string) TurboK8sActionExecutor {
+func NewTurboK8sActionExecutor(clusterScraper *cluster.ClusterScraper,
+	podManager util.IPodManager, ormClient *resourcemapping.ORMClientManager,
+	gitConfig gitops.GitConfig, clusterId string) TurboK8sActionExecutor {
 	return TurboK8sActionExecutor{
 		clusterScraper: clusterScraper,
-		cApiClient:     cApiClient,
 		podManager:     podManager,
-		ormClient:      ormSpec,
+		ormClient:      ormClient,
 		gitConfig:      gitConfig,
 		k8sClusterId:   clusterId,
 	}

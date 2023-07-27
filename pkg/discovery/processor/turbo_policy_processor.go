@@ -26,13 +26,20 @@ func (p *TurboPolicyProcessor) ProcessTurboPolicies() {
 	turboSloScalings, err := p.ClusterScraper.GetAllTurboSLOScalings()
 	if err != nil {
 		glog.Warningf("Failed to list SLOHorizontalScales: %v.", err)
+	}
+
+	turboCvsScalings, err := p.ClusterScraper.GetAllTurboCVSScalings()
+	if err != nil {
+		glog.Warningf("Failed to list ContainerVerticalScales: %v.", err)
+	}
+	policies := len(turboSloScalings) + len(turboCvsScalings)
+	if policies == 0 {
+		glog.V(2).Info("There is no SLOHorizontalScale or ContainerVerticalScale resource found in the cluster.")
 		return
 	}
-	if len(turboSloScalings) == 0 {
-		glog.V(2).Info("There is no SLOHorizontalScale resource found in the cluster.")
-		return
-	}
+
 	glog.V(2).Infof("Discovered %v SLOHorizontalScale policies.", len(turboSloScalings))
+	glog.V(2).Infof("Discovered %v ContainerVerticalScale policies.", len(turboCvsScalings))
 
 	turboPolicyBindings, err := p.ClusterScraper.GetAllTurboPolicyBindings()
 	if err != nil {
@@ -46,17 +53,27 @@ func (p *TurboPolicyProcessor) ProcessTurboPolicies() {
 	glog.V(2).Infof("Discovered %v PolicyBindings.", len(turboPolicyBindings))
 
 	policyMap := make(map[string]*repository.TurboPolicy)
+
 	for _, sloScale := range turboSloScalings {
-		// Create a copy as sloScale variable is reused during range loop
-		sloScaleCopy := sloScale
-		gvk := sloScaleCopy.GetObjectKind().GroupVersionKind()
-		if gvk.Empty() {
-			continue
+		if gvk := sloScale.GetObjectKind().GroupVersionKind(); !gvk.Empty() {
+			// Create a copy as sloScale variable is reused during range loop
+			sloScaleCopy := sloScale
+			policyId := createPolicyId(gvk.Kind, sloScaleCopy.GetNamespace(), sloScaleCopy.GetName())
+			policyMap[policyId] = repository.
+				NewTurboPolicy().
+				WithSLOHorizontalScale(&sloScaleCopy)
 		}
-		policyId := createPolicyId(gvk.Kind, sloScaleCopy.GetNamespace(), sloScaleCopy.GetName())
-		policyMap[policyId] = repository.
-			NewTurboPolicy().
-			WithSLOHorizontalScale(&sloScaleCopy)
+	}
+
+	for _, cvsScale := range turboCvsScalings {
+		if gvk := cvsScale.GetObjectKind().GroupVersionKind(); !gvk.Empty() {
+			// Create a copy as cvsScale variable is reused during range loop
+			cvsScaleCopy := cvsScale
+			policyId := createPolicyId(gvk.Kind, cvsScaleCopy.GetNamespace(), cvsScaleCopy.GetName())
+			policyMap[policyId] = repository.
+				NewTurboPolicy().
+				WithContainerVerticalScale(&cvsScaleCopy)
+		}
 	}
 
 	var policyBindings []*repository.TurboPolicyBinding

@@ -1,6 +1,7 @@
 package kubeturbo
 
 import (
+	osclient "github.com/openshift/client-go/apps/clientset/versioned"
 	"github.com/openshift/machine-api-operator/pkg/generated/clientset/versioned"
 	"k8s.io/client-go/dynamic"
 	kubeclient "k8s.io/client-go/kubernetes"
@@ -29,9 +30,10 @@ type Config struct {
 	DynamicClient dynamic.Interface
 	KubeletClient *kubeletclient.KubeletClient
 	CAClient      *versioned.Clientset
+	OsClient      *osclient.Clientset
 	// ORMClient builds operator resource mapping templates fetched from OperatorResourceMapping CR in discovery client
 	// and provides the capability to update the corresponding CR for an Operator managed resource in action execution client.
-	ORMClient *resourcemapping.ORMClient
+	ORMClientManager *resourcemapping.ORMClientManager
 	// Controller Runtime Client
 	ControllerRuntimeClient runtimeclient.Client
 	// Close this to stop all reflectors
@@ -56,7 +58,6 @@ type Config struct {
 
 	failVolumePodMoves      bool
 	updateQuotaToAllowMoves bool
-	clusterAPIEnabled       bool
 	clusterKeyInjected      string
 	readinessRetryThreshold int
 	gitConfig               gitops.GitConfig
@@ -93,6 +94,11 @@ func (c *Config) WithDynamicClient(client dynamic.Interface) *Config {
 	return c
 }
 
+func (c *Config) WithOpenshiftClient(client *osclient.Clientset) *Config {
+	c.OsClient = client
+	return c
+}
+
 func (c *Config) WithClusterAPIClient(client *versioned.Clientset) *Config {
 	c.CAClient = client
 	return c
@@ -103,8 +109,8 @@ func (c *Config) WithKubeletClient(client *kubeletclient.KubeletClient) *Config 
 	return c
 }
 
-func (c *Config) WithORMClient(client *resourcemapping.ORMClient) *Config {
-	c.ORMClient = client
+func (c *Config) WithORMClientManager(client *resourcemapping.ORMClientManager) *Config {
+	c.ORMClientManager = client
 	return c
 }
 
@@ -200,11 +206,6 @@ func (c *Config) WithVolumePodMoveConfig(failVolumePodMoves bool) *Config {
 
 func (c *Config) WithQuotaUpdateConfig(updateQuotaToAllowMoves bool) *Config {
 	c.updateQuotaToAllowMoves = updateQuotaToAllowMoves
-	return c
-}
-
-func (c *Config) WithClusterAPIEnabled(clusterAPIEnabled bool) *Config {
-	c.clusterAPIEnabled = clusterAPIEnabled
 	return c
 }
 

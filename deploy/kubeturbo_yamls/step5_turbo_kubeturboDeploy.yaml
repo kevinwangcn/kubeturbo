@@ -21,8 +21,8 @@ spec:
       serviceAccountName: turbo-user
       containers:
       - name: kubeturbo
-        # Replace the image with desired version:8.7.5 or snapshot version:8.7.5-SNAPSHOT from icr.io
-        image: icr.io/cpopen/turbonomic/kubeturbo:8.7.5
+        # Replace the image with desired version:8.7.6 or snapshot version:8.7.6-SNAPSHOT from icr.io
+        image: icr.io/cpopen/turbonomic/kubeturbo:8.7.6
         env:
           - name: KUBETURBO_NAMESPACE
             valueFrom:
@@ -49,10 +49,26 @@ spec:
           # Note kubernetes.io/os=windows and/or beta.kubernetes.io/os=windows labels will be automatically excluded by default.
           # If specified all the labels will be used to select the node ignoring the default.
           #- --cpufreq-job-exclude-node-labels=kubernetes.io/key=value
+          # The complete cpufreqgetter image uri used for fallback node cpu frequency getter job.
+          #- --cpufreqgetter-image=icr.io/cpopen/turbonomic/cpufreqgetter
+          # The name of the secret that stores the image pull credentials for cpufreqgetter image.
+          #- --cpufreqgetter-image-pull-secret=<secret-name>
           # Uncomment to stitch using IP, or if using Openstack, Hyper-V/VMM
           #- --stitch-uuid=false
           # Uncomment to customize readiness retry threshold. Kubeturbo will try readiness-retry-threshold times before giving up. Default is 60. The retry interval is 10s.
           #- --readiness-retry-threshold=60
+          # Uncomment to disable the cleanup of the resources which are created by kubeturbo for the scc impersonation
+          #- --cleanup-scc-impersonation-resources=false
+          # [ArgoCD integration] The email to be used to push changes to git
+          #- --git-email=""
+          # [ArgoCD integration] The username to be used to push changes to git
+          #- --git-username=""
+          # [ArgoCD integration] The name of the secret which holds the git credentials
+          #- --git-secret-name""
+          # [ArgoCD integration] The namespace of the secret which holds the git credentials
+          #- --git-secret-namespace=""
+          # [ArgoCD integration] The commit mode that should be used for git action executions. One of {request|direct}. Defaults to direct
+          #- --git-commit-mode=""
         volumeMounts:
           # volume will be created, any name will work and must match below
           - name: turbo-volume

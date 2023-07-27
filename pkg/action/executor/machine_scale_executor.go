@@ -45,22 +45,26 @@ func (s *MachineActionExecutor) Execute(vmDTO *TurboActionExecutorInput) (*Turbo
 	case proto.ActionItemDTO_PROVISION:
 		actionType = ProvisionAction
 		diff = 1
-		break
 	case proto.ActionItemDTO_SUSPEND:
 		actionType = SuspendAction
 		diff = -1
-		break
 	default:
 		return nil, fmt.Errorf("unsupported action type %v", vmDTO.ActionItems[0].GetActionType())
 	}
 	// Get on with it.
-	controller, key, err := newController(s.cAPINamespace, nodeName, diff, actionType,
-		s.executor.cApiClient, s.executor.clusterScraper.Clientset)
+	controller, key, err := newController(s.cAPINamespace, nodeName, diff, actionType, s.executor.clusterScraper)
 	if err != nil {
 		return nil, err
 	} else if key == nil {
 		return nil, fmt.Errorf("the target machine deployment has no name")
 	}
+	scaleDirection := "up"
+	scaleAmount := diff
+	if diff < 0 {
+		scaleDirection = "down"
+		scaleAmount = -diff
+	}
+	glog.V(2).Infof("Starting to scale %s the machineSet %s by %d replica", scaleDirection, *key, scaleAmount)
 	// See if we already have this.
 	_, ok := s.cache.Get(*key)
 	if ok {
@@ -81,5 +85,6 @@ func (s *MachineActionExecutor) Execute(vmDTO *TurboActionExecutorInput) (*Turbo
 	if err != nil {
 		return nil, err
 	}
+	glog.V(2).Infof("Completed scaling %s the machineSet %s by %d replica", scaleDirection, *key, scaleAmount)
 	return &TurboActionExecutorOutput{Succeeded: true}, nil
 }

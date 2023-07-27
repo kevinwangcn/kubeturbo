@@ -35,8 +35,12 @@ data:
                 "turboServer": "https://<Turbo_server_URL>"
             },
             "restAPIConfig": {
-                "opsManagerUserName": "<Turbo_username>",
-                "opsManagerPassword": "<Turbo_password>"
+                "opsManagerUserName": "<Turbo_username_plaintext>",
+                "opsManagerPassword": "<Turbo_password_plaintext>"
+            },
+            "sdkProtocolConfig": {
+                "registrationTimeoutSec": 300,
+                "restartOnRegistrationTimeout": false
             }
         },
         "targetConfig": {
@@ -49,5 +53,12 @@ data:
             "containerSpec": "<regex>",
             "namespace": "<regex>",
             "workloadController": "<regex>"
+        }
+    }
+  # Autoreload configuration will be applied without pod restart but takes about 1 minute to take effect
+  turbo-autoreload.config: |-
+    {
+        "logging": {
+           "level": 2
         }
     }

@@ -41,7 +41,7 @@ type controllerSpec struct {
 
 // newK8sControllerUpdaterViaPod returns a k8sControllerUpdater based on the parent kind of a pod
 func newK8sControllerUpdaterViaPod(clusterScraper *cluster.ClusterScraper, pod *api.Pod,
-	ormClient *resourcemapping.ORMClient, gitConfig gitops.GitConfig, clusterId string) (*k8sControllerUpdater, error) {
+	ormClient *resourcemapping.ORMClientManager, gitConfig gitops.GitConfig, clusterId string) (*k8sControllerUpdater, error) {
 	// Find parent kind of the pod
 	ownerInfo, _, _, err := clusterScraper.GetPodControllerInfo(pod, true)
 	if err != nil {
@@ -61,16 +61,19 @@ func newK8sControllerUpdaterViaPod(clusterScraper *cluster.ClusterScraper, pod *
 }
 
 // newK8sControllerUpdater returns a k8sControllerUpdater based on the controller kind
-func newK8sControllerUpdater(clusterScraper *cluster.ClusterScraper, ormClient *resourcemapping.ORMClient, kind,
+func newK8sControllerUpdater(clusterScraper *cluster.ClusterScraper,
+	ormClient *resourcemapping.ORMClientManager, kind,
 	controllerName, podName, namespace, clusterId string, managerApp *repository.K8sApp, gitConfig gitops.GitConfig) (*k8sControllerUpdater, error) {
 	res, err := GetSupportedResUsingKind(kind, namespace, controllerName)
 	if err != nil {
 		return nil, err
 	}
+
 	return &k8sControllerUpdater{
 		controller: &parentController{
 			clients: kubeClients{
 				typedClient:         clusterScraper.Clientset,
+				osClient:            clusterScraper.OsClient,
 				dynClient:           clusterScraper.DynamicClient,
 				dynNamespacedClient: clusterScraper.DynamicClient.Resource(res).Namespace(namespace),
 			},
@@ -228,14 +231,32 @@ func (c *k8sControllerUpdater) suspendOrProvision(current, diff int32) (int32, e
 // suspendPod takes the name of a pod and deletes it
 // The call does not block
 func (c *k8sControllerUpdater) suspendPod() error {
-	podClient := c.client.CoreV1().Pods(c.namespace)
-	if _, err := podClient.Get(context.TODO(), c.podName, metav1.GetOptions{}); err != nil {
-		return fmt.Errorf("failed to get latest pod %s/%s: %v", c.namespace, c.podName, err)
+	namespace := c.namespace
+	podName := c.podName
+	// Check if namespace is empty
+	if namespace == "" {
+		glog.Warningf("namespace value is not specified")
+		return nil
+	}
+
+	// Check if pod name is empty or nil
+	if podName == "" {
+		glog.Warningf("pod name is not specified")
+		return nil
+	}
+	podClient := c.client.CoreV1().Pods(namespace)
+	if _, err := podClient.Get(context.TODO(), podName, metav1.GetOptions{}); err != nil {
+		return fmt.Errorf("failed to get latest pod %s/%s: %v", namespace, podName, err)
 	}
 	// This function does not block
 	if err := podClient.Delete(context.TODO(), c.podName, metav1.DeleteOptions{}); err != nil {
-		return fmt.Errorf("failed to delete pod %s/%s: %v", c.namespace, c.podName, err)
+		return fmt.Errorf("failed to delete pod %s/%s: %v", namespace, podName, err)
 	}
-	glog.V(2).Infof("Successfully suspended pod %s/%s", c.namespace, c.podName)
+	glog.V(2).Infof("Successfully suspended pod %s/%s", namespace, podName)
 	return nil
+}
+
+// revert the change
+func (c *k8sControllerUpdater) revertChange() error {
+	return c.controller.revert()
 }

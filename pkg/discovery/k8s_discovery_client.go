@@ -7,8 +7,10 @@ import (
 
 	"github.com/KimMachineGun/automemlimit/memlimit"
 	"github.com/golang/glog"
+	"github.com/turbonomic/turbo-go-sdk/pkg/builder"
 	sdkprobe "github.com/turbonomic/turbo-go-sdk/pkg/probe"
 	"github.com/turbonomic/turbo-go-sdk/pkg/proto"
+	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 
 	"github.com/turbonomic/kubeturbo/pkg/cluster"
@@ -18,6 +20,7 @@ import (
 	"github.com/turbonomic/kubeturbo/pkg/discovery/processor"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/worker"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/worker/compliance"
+	"github.com/turbonomic/kubeturbo/pkg/discovery/worker/compliance/podaffinity"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/worker/k8sappcomponents"
 	"github.com/turbonomic/kubeturbo/pkg/features"
 	"github.com/turbonomic/kubeturbo/pkg/registration"
@@ -34,7 +37,7 @@ const (
 )
 
 type DiscoveryClientConfig struct {
-	probeConfig                *configs.ProbeConfig
+	probeConfig                *configs.ProbeConfig //contains the k8s resources clients
 	targetConfig               *configs.K8sTargetConfig
 	ValidationWorkers          int
 	ValidationTimeoutSec       int
@@ -49,7 +52,7 @@ type DiscoveryClientConfig struct {
 	containerUsageDataAggStrategy string
 	// ORMClient builds operator resource mapping templates fetched from OperatorResourceMapping CR so that action
 	// execution client will be able to execute action on operator-managed resources based on resource mapping templates.
-	OrmClient *resourcemapping.ORMClient
+	ORMClientManager *resourcemapping.ORMClientManager
 	// Number of workload controller items the list api call should request for
 	itemsPerListQuery int
 	// VCPU Throttling threshold
@@ -59,7 +62,7 @@ type DiscoveryClientConfig struct {
 func NewDiscoveryConfig(probeConfig *configs.ProbeConfig,
 	targetConfig *configs.K8sTargetConfig, ValidationWorkers int,
 	ValidationTimeoutSec int, containerUtilizationDataAggStrategy,
-	containerUsageDataAggStrategy string, ormClient *resourcemapping.ORMClient,
+	containerUsageDataAggStrategy string, ormClientManager *resourcemapping.ORMClientManager,
 	discoveryWorkers, discoveryTimeoutMin, discoverySamples,
 	discoverySampleIntervalSec, itemsPerListQuery int) *DiscoveryClientConfig {
 	if discoveryWorkers < minDiscoveryWorker {
@@ -86,7 +89,7 @@ func NewDiscoveryConfig(probeConfig *configs.ProbeConfig,
 		ValidationTimeoutSec:                ValidationTimeoutSec,
 		containerUtilizationDataAggStrategy: containerUtilizationDataAggStrategy,
 		containerUsageDataAggStrategy:       containerUsageDataAggStrategy,
-		OrmClient:                           ormClient,
+		ORMClientManager:                    ormClientManager,
 		DiscoveryWorkers:                    discoveryWorkers,
 		DiscoveryTimeoutSec:                 discoveryTimeoutMin,
 		DiscoverySamples:                    discoverySamples,
@@ -296,6 +299,7 @@ func (dc *K8sDiscoveryClient) Discover(
 	discoveryResponse = &proto.DiscoveryResponse{
 		DiscoveredGroup: groupDTOs,
 		EntityDTO:       newDiscoveryResultDTOs,
+		ActionPolicies:  dc.getTargetActionPolicies(),
 	}
 
 	newFrameworkDiscTime := time.Now().Sub(currentTime).Seconds()
@@ -307,16 +311,53 @@ func (dc *K8sDiscoveryClient) Discover(
 // DiscoverWithNewFramework performs the actual discovery.
 func (dc *K8sDiscoveryClient) DiscoverWithNewFramework(targetID string) ([]*proto.EntityDTO, []*proto.GroupDTO, error) {
 	// CREATE CLUSTER, NODES, NAMESPACES, QUOTAS, SERVICES HERE
+	start := time.Now()
 	clusterSummary, err := dc.clusterProcessor.DiscoverCluster()
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to process cluster: %v", err)
 	}
+	glog.V(3).Infof("Discovering cluster resources took %s", time.Since(start))
 
-	// Cache operatorResourceSpecMap in ormClient
-	numCRs := dc.Config.OrmClient.CacheORMSpecMap()
-	if numCRs > 0 {
-		glog.Infof("Discovered %v Operator managed Custom Resources in cluster %s.", numCRs, targetID)
+	// affinity process with new algorithm
+	var nodesPods map[string][]string
+	var podsWithAffinities sets.String
+	var hostnameSpreadWorkloads map[string]sets.String
+	var otherSpreadPods sets.String
+	if !utilfeature.DefaultFeatureGate.Enabled(features.IgnoreAffinities) {
+		if utilfeature.DefaultFeatureGate.Enabled(features.NewAffinityProcessing) {
+			glog.V(2).Infof("Begin to process affinity with new algorithm.")
+			start := time.Now()
+			namespaceLister, err := podaffinity.NewNamespaceLister(dc.k8sClusterScraper.Clientset, clusterSummary)
+			if err != nil {
+				glog.Errorf("Error creating affinity processor: %v", err)
+			} else {
+				affinityProcessor, err := podaffinity.New(clusterSummary,
+					podaffinity.NewNodeInfoLister(clusterSummary), namespaceLister)
+				if err != nil {
+					glog.Errorf("Failure in processing affinity rules: %s", err)
+				} else {
+					nodesPods, podsWithAffinities, hostnameSpreadWorkloads, otherSpreadPods = affinityProcessor.ProcessAffinities(clusterSummary.Pods)
+				}
+				glog.V(2).Infof("Successfully processed affinities.")
+				glog.V(3).Infof("Processing affinities with new algorithm took %s", time.Since(start))
+				if glog.V(3) {
+					nodeCommsTotal := 0
+					for node, pods := range nodesPods {
+						nodeCommsTotal += len(pods)
+						glog.Infof("Node %s will sell %v affinity related commodities.", node, len(pods))
+					}
+					glog.Infof("Total %v affinity related commodities will be sold by all nodes.", nodeCommsTotal)
+				}
+				glog.V(6).Infof("\n\nProcessed affinity result: \n\n %++v \n\n %++v \n\n",
+					nodesPods, podsWithAffinities)
+			}
+		}
+	} else {
+		glog.V(2).Infof("Ignoring affinities.")
 	}
+
+	// ORM Discovery
+	dc.Config.ORMClientManager.DiscoverORMs()
 
 	// Multiple discovery workers to create node and pod DTOs
 	nodes := clusterSummary.Nodes
@@ -325,17 +366,20 @@ func (dc *K8sDiscoveryClient) DiscoverWithNewFramework(targetID string) ([]*prot
 	// Stops scheduling dispatcher to assign sampling discovery tasks.
 	dc.samplingDispatcher.FinishSampling()
 
+	start = time.Now()
 	// Discover pods and create DTOs for nodes, namespaces, controllers, pods, containers, application.
 	// Merge collected usage data samples from globalEntityMetricSink into the metric sink of each individual discovery worker.
 	// Collect the kubePod, kubeNamespace metrics, groups and kubeControllers from all the discovery workers.
-	taskCount := dc.dispatcher.Dispatch(nodes, clusterSummary)
+	taskCount := dc.dispatcher.Dispatch(nodes, nodesPods, podsWithAffinities, otherSpreadPods, hostnameSpreadWorkloads, clusterSummary)
 	result := dc.resultCollector.Collect(taskCount)
+	glog.V(3).Infof("Collection and processing of metrics from node kubelets took %s", time.Since(start))
 
 	// Clear globalEntityMetricSink cache after collecting full discovery results
 	dc.globalEntityMetricSink.ClearCache()
 	// Reschedule dispatch sampling discovery tasks for newly discovered nodes
 	dc.samplingDispatcher.ScheduleDispatch(nodes)
 
+	start = time.Now()
 	// Namespace discovery worker to create namespace DTOs
 	stitchType := dc.Config.probeConfig.StitchingPropertyType
 	namespacesDiscoveryWorker := worker.Newk8sNamespaceDiscoveryWorker(clusterSummary, stitchType)
@@ -398,9 +442,11 @@ func (dc *K8sDiscoveryClient) DiscoverWithNewFramework(targetID string) ([]*prot
 	result.EntityDTOs = append(result.EntityDTOs, businessAppEntityDTOBuilderEntityDTOs...)
 
 	glog.V(2).Infof("There are totally %d entityDTOs.", len(result.EntityDTOs))
+	glog.V(3).Infof("Postprocessing and aggregatig DTOs took %s", time.Since(start))
 
 	// affinity process
-	if !utilfeature.DefaultFeatureGate.Enabled(features.IgnoreAffinities) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.IgnoreAffinities) &&
+		!utilfeature.DefaultFeatureGate.Enabled(features.NewAffinityProcessing) {
 		glog.V(2).Infof("Begin to process affinity.")
 		affinityProcessor, err := compliance.NewAffinityProcessor(clusterSummary)
 		if err != nil {
@@ -409,18 +455,18 @@ func (dc *K8sDiscoveryClient) DiscoverWithNewFramework(targetID string) ([]*prot
 			result.EntityDTOs = affinityProcessor.ProcessAffinityRules(result.EntityDTOs)
 		}
 		glog.V(2).Infof("Successfully processed affinity.")
-	} else {
-		glog.V(2).Infof("Ignoring affinities.")
 	}
 
 	// Taint-toleration process to create access commodities
 	glog.V(2).Infof("Begin to process taints and tolerations")
+	start = time.Now()
 	taintTolerationProcessor, err := compliance.NewTaintTolerationProcessor(clusterSummary)
 	if err != nil {
 		glog.Errorf("Failed during process taints and tolerations: %v", err)
 	} else {
 		// Add access commodities to entity DOTs based on the taint-toleration rules
 		taintTolerationProcessor.Process(result.EntityDTOs)
+		glog.V(3).Infof("Processing taints took %s", time.Since(start))
 	}
 
 	glog.V(2).Infof("Successfully processed taints and tolerations.")
@@ -449,4 +495,18 @@ func (dc *K8sDiscoveryClient) DiscoverWithNewFramework(targetID string) ([]*prot
 	}
 
 	return result.EntityDTOs, groupDTOs, nil
+}
+
+func (dc *K8sDiscoveryClient) getTargetActionPolicies() []*proto.ActionPolicyDTO {
+	if dc.k8sClusterScraper.IsClusterAPIEnabled() {
+		// Set target level action policy for virtual machine entity type if cluster API is enabled
+		glog.V(2).Info("Cluster API is available. Set node action policy for this cluster.")
+		entityType := proto.EntityDTO_VIRTUAL_MACHINE
+		return builder.NewActionPolicyBuilder().
+			WithEntityActions(entityType, proto.ActionItemDTO_PROVISION, proto.ActionPolicyDTO_SUPPORTED).
+			WithEntityActions(entityType, proto.ActionItemDTO_SUSPEND, proto.ActionPolicyDTO_SUPPORTED).
+			Create()
+	}
+	glog.V(2).Info("Cluster API is not available. Do not set node action policy for this cluster.")
+	return nil
 }

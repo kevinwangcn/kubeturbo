@@ -5,14 +5,15 @@ import (
 	"strings"
 
 	api "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 
+	"github.com/turbonomic/kubeturbo/pkg/cluster"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/dtofactory/property"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/metrics"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/repository"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/stitching"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/util"
 	"github.com/turbonomic/kubeturbo/pkg/features"
-	v1 "k8s.io/api/core/v1"
 
 	sdkbuilder "github.com/turbonomic/turbo-go-sdk/pkg/builder"
 	"github.com/turbonomic/turbo-go-sdk/pkg/proto"
@@ -75,9 +76,14 @@ type podEntityDTOBuilder struct {
 	pendingPods          []*api.Pod
 	clusterKeyInjected   string
 	mirrorPodToDaemonMap map[string]bool
+	ClusterScraper       *cluster.ClusterScraper
+	podsWithAffinities   sets.String
+	hostnameSpreadPods   sets.String
+	otherSpreadPods      sets.String
+	podsToControllers    map[string]string
 }
 
-func NewPodEntityDTOBuilder(sink *metrics.EntityMetricSink, stitchingManager *stitching.StitchingManager) *podEntityDTOBuilder {
+func NewPodEntityDTOBuilder(sink *metrics.EntityMetricSink, stitchingManager *stitching.StitchingManager, clusterScraper *cluster.ClusterScraper) *podEntityDTOBuilder {
 	return &podEntityDTOBuilder{
 		generalBuilder:       newGeneralBuilder(sink),
 		stitchingManager:     stitchingManager,
@@ -86,6 +92,7 @@ func NewPodEntityDTOBuilder(sink *metrics.EntityMetricSink, stitchingManager *st
 		podToVolumesMap:      make(map[string][]repository.MountedVolume),
 		nodeNameToNodeMap:    make(map[string]*repository.KubeNode),
 		mirrorPodToDaemonMap: make(map[string]bool),
+		ClusterScraper:       clusterScraper,
 	}
 }
 
@@ -126,6 +133,26 @@ func (builder *podEntityDTOBuilder) WithPendingPods(pendingPods []*api.Pod) *pod
 
 func (builder *podEntityDTOBuilder) WithMirrorPodToDaemonMap(mirrorPodToDaemonMap map[string]bool) *podEntityDTOBuilder {
 	builder.mirrorPodToDaemonMap = mirrorPodToDaemonMap
+	return builder
+}
+
+func (builder *podEntityDTOBuilder) WithPodsWithAffinities(podsWithAffinities sets.String) *podEntityDTOBuilder {
+	builder.podsWithAffinities = podsWithAffinities
+	return builder
+}
+
+func (builder *podEntityDTOBuilder) WithHostnameSpreadPods(hostnameSpreadPods sets.String) *podEntityDTOBuilder {
+	builder.hostnameSpreadPods = hostnameSpreadPods
+	return builder
+}
+
+func (builder *podEntityDTOBuilder) WithOtherSpreadPods(otherSpreadPods sets.String) *podEntityDTOBuilder {
+	builder.otherSpreadPods = otherSpreadPods
+	return builder
+}
+
+func (builder *podEntityDTOBuilder) WithPodsToControllers(podsToControllers map[string]string) *podEntityDTOBuilder {
+	builder.podsToControllers = podsToControllers
 	return builder
 }
 
@@ -390,8 +417,8 @@ func (builder *podEntityDTOBuilder) getPodQuotaCommoditiesSold(pod *api.Pod) ([]
 
 // Build the CommodityDTOs bought by the pod from the node provider.
 // Commodities bought are vCPU, vMem vmpm access, cluster
-func (builder *podEntityDTOBuilder) getPodCommoditiesBought(
-	pod *api.Pod, resCommTypeBoughtFromNode []metrics.ResourceType) ([]*proto.CommodityDTO, error) {
+func (builder *podEntityDTOBuilder) getPodCommoditiesBought(pod *api.Pod,
+	resCommTypeBoughtFromNode []metrics.ResourceType) ([]*proto.CommodityDTO, error) {
 	var commoditiesBought []*proto.CommodityDTO
 
 	// Resource Commodities.
@@ -431,6 +458,17 @@ func (builder *podEntityDTOBuilder) getPodCommoditiesBought(
 		}
 	}
 
+	// Add pods own qualified name as Label commodity to honor placement as per affinities
+	// Nodes where this pod can be placed will sell this commodity
+	// Also add segmentation commodity for pods which are part of hostname spread workloads
+	if utilfeature.DefaultFeatureGate.Enabled(features.NewAffinityProcessing) {
+		affinityComms, err := builder.getAffinityRelatedCommodities(pod.Namespace + "/" + pod.Name)
+		if err != nil {
+			return nil, err
+		}
+		commoditiesBought = append(commoditiesBought, affinityComms...)
+	}
+
 	// Cluster commodity.
 	clusterMetricUID := metrics.GenerateEntityStateMetricUID(metrics.ClusterType, "", metrics.Cluster)
 	clusterInfo, err := builder.metricsSink.GetMetric(clusterMetricUID)
@@ -461,6 +499,49 @@ func (builder *podEntityDTOBuilder) getPodCommoditiesBought(
 	}
 
 	return commoditiesBought, nil
+}
+
+func (builder *podEntityDTOBuilder) getAffinityRelatedCommodities(podQualifiedName string) ([]*proto.CommodityDTO, error) {
+	var affinityComms []*proto.CommodityDTO = nil
+	// A pod could have multiple affinity/anti-affinity rules
+	// resulting in multiple commodities wrt to different rule types
+	if builder.podsWithAffinities.Has(podQualifiedName) {
+		key, exists := builder.podsToControllers[podQualifiedName]
+		if !exists || builder.otherSpreadPods.Has(podQualifiedName) {
+			key = podQualifiedName
+		}
+		comm, err := sdkbuilder.NewCommodityDTOBuilder(proto.CommodityDTO_LABEL).
+			Key(key).
+			Create()
+		if err != nil {
+			glog.Errorf("Failed to ceate affinity label commodity for pod %s", podQualifiedName)
+			return nil, err
+		}
+		glog.V(5).Infof("Adding affinity label commodity for Pod %s", podQualifiedName)
+		affinityComms = append(affinityComms, comm)
+	}
+
+	if builder.hostnameSpreadPods.Has(podQualifiedName) {
+		key, exists := builder.podsToControllers[podQualifiedName]
+		if !exists {
+			// spread workload means that this pod should have a parent
+			// as we could not find its parent, there is no point adding this commodity for this pod
+			glog.Warningf("Parent for spread workload pod %s not found", podQualifiedName)
+			return affinityComms, nil
+		}
+		comm, err := sdkbuilder.NewCommodityDTOBuilder(proto.CommodityDTO_SEGMENTATION).
+			Key(key).
+			Used(1).
+			Create()
+		if err != nil {
+			glog.Errorf("Failed to ceate affinity segmentation commodity for pod %s", podQualifiedName)
+			return nil, err
+		}
+		glog.V(5).Infof("Adding affinity segmentation commodity for Pod %s", podQualifiedName)
+		affinityComms = append(affinityComms, comm)
+	}
+
+	return affinityComms, nil
 }
 
 // Build the CommodityDTOs bought by the pod from the quota provider.
@@ -536,7 +617,7 @@ func (builder *podEntityDTOBuilder) getPodProperties(pod *api.Pod, vols []reposi
 	properties = append(properties, stitchingProperty)
 
 	if len(vols) > 0 {
-		var apiVols []*v1.PersistentVolume
+		var apiVols []*api.PersistentVolume
 		for _, vol := range vols {
 			apiVols = append(apiVols, vol.UsedVolume)
 		}
@@ -579,6 +660,24 @@ func (builder *podEntityDTOBuilder) createContainerPodData(pod *api.Pod) *proto.
 	if util.PodIsReady(pod) && pod.Status.PodIP == "" {
 		glog.Errorf("No IP found for pod %s", fullName)
 	}
+
+	if builder.ClusterScraper != nil {
+		ownerInfo, _, _, err := builder.ClusterScraper.GetPodControllerInfo(pod, true)
+		if err != nil || util.IsOwnerInfoEmpty(ownerInfo) {
+			// The pod does not have a controller
+			glog.V(3).Infof("Skip adding workload controller data for pod %v/%v: pod has no controller.",
+				pod.Namespace, pod.Name)
+			return podData
+		}
+
+		controllerData := CreateWorkloadControllerDataByControllerType(ownerInfo.Kind)
+		podData.ControllerData = controllerData
+	} else {
+		// ClusterScraper is not initialized
+		glog.V(3).Infof("Skip adding workload controller data for pod %v/%v: ClusterScraper is not initialized.",
+			pod.Namespace, pod.Name)
+	}
+
 	return podData
 }
 

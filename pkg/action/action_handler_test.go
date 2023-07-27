@@ -31,8 +31,9 @@ func TestActionHandler_registerActionExecutors(t *testing.T) {
 
 	h.registerActionExecutors()
 
-	supportedActions := [...]turboActionType{turboActionPodProvision, turboActionPodMove,
-		turboActionContainerResize, turboActionPodSuspend, turboActionControllerResize}
+	supportedActions := [...]turboActionType{turboActionPodProvision, turboActionControllerScale, turboActionPodMove,
+		turboActionContainerResize, turboActionPodSuspend, turboActionControllerResize,
+		turboActionMachineProvision, turboActionMachineSuspend}
 	m := h.actionExecutors
 	if len(m) != len(supportedActions) {
 		t.Errorf("Action handler supports %d action types but got %d", len(supportedActions), len(m))
@@ -113,7 +114,7 @@ func newActionHandlerConfig() *ActionHandlerConfig {
 
 	config.StopEverything = make(chan struct{})
 	config.clusterScraper = cluster.NewClusterScraper(nil, &client.Clientset{}, nil, nil,
-		false, nil, "")
+		nil, nil, "")
 	config.kubeletClient = &kubeclient.KubeletClient{}
 
 	return config

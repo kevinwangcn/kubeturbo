@@ -9,7 +9,6 @@ import (
 	"github.com/turbonomic/kubeturbo/cmd/kubeturbo/app"
 	"github.com/turbonomic/kubeturbo/test/integration/framework"
 	v1 "k8s.io/api/core/v1"
-	apiextclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/typed/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -66,6 +65,7 @@ var _ = Describe("Action Executor ", func() {
 	var origCRValue4NsScope, origCRValue4ClusterScope interface{}
 
 	BeforeEach(func() {
+		//Skip("As the OCP48 cluster is hitting some problems, temporally skip all of ORM test!")
 		if !framework.TestContext.IsOpenShiftTest {
 			Skip("Ignoring the case for ORM test.")
 		}
@@ -84,23 +84,20 @@ var _ = Describe("Action Executor ", func() {
 
 			s := app.NewVMTServer()
 			kubeletClient := s.CreateKubeletClientOrDie(kubeConfig, kubeClient, "", "icr.io/cpopen/turbonomic/cpufreqgetter", map[string]set.Set{}, true)
-			apiExtClient, err := apiextclient.NewForConfig(kubeConfig)
-			if err != nil {
-				glog.Fatalf("Failed to generate apiExtensions client for kubernetes target: %v", err)
-			}
+
 			runtimeClient, err := runtimeclient.New(kubeConfig, runtimeclient.Options{})
 			if err != nil {
 				glog.Fatalf("Failed to create controller runtime client: %v.", err)
 			}
-			ormClient := resourcemapping.NewORMClient(dynamicClient, apiExtClient)
+			ormClient := resourcemapping.NewORMClientManager(dynamicClient, kubeConfig)
 			probeConfig := createProbeConfigOrDie(kubeClient, kubeletClient, dynamicClient, runtimeClient)
 
 			discoveryClientConfig := discovery.NewDiscoveryConfig(probeConfig, nil, app.DefaultValidationWorkers,
 				app.DefaultValidationTimeout, aggregation.DefaultContainerUtilizationDataAggStrategy,
 				aggregation.DefaultContainerUsageDataAggStrategy, ormClient, app.DefaultDiscoveryWorkers, app.DefaultDiscoveryTimeoutSec,
 				app.DefaultDiscoverySamples, app.DefaultDiscoverySampleIntervalSec, 0)
-			actionHandlerConfig := action.NewActionHandlerConfig("", nil, nil,
-				cluster.NewClusterScraper(nil, kubeClient, dynamicClient, nil, false, nil, ""),
+			actionHandlerConfig := action.NewActionHandlerConfig("", nil,
+				cluster.NewClusterScraper(nil, kubeClient, dynamicClient, nil, nil, nil, ""),
 				[]string{"*"}, ormClient, false, true, 60, gitops.GitConfig{}, "test-cluster-id")
 
 			actionHandler = action.NewActionHandler(actionHandlerConfig)
@@ -108,7 +105,7 @@ var _ = Describe("Action Executor ", func() {
 			// Kubernetes Probe Discovery Client
 			discoveryClient := discovery.NewK8sDiscoveryClient(discoveryClientConfig)
 			// Cache operatorResourceSpecMap in ormClient
-			discoveryClient.Config.OrmClient.CacheORMSpecMap()
+			discoveryClient.Config.ORMClientManager.CacheORMSpecMap()
 		}
 
 	})

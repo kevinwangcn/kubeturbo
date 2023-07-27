@@ -7,10 +7,11 @@ replicaCount: 1
 # Replace the image with desired version
 image:
   repository: icr.io/cpopen/turbonomic/kubeturbo
-  tag: 8.7.5
+  tag: 8.7.6
   pullPolicy: IfNotPresent
 #  busyboxRepository: busybox
 #  imagePullSecret: ""
+#  cpufreqgetterRepository: icr.io/cpopen/turbonomic/cpufreqgetter
 
 annotations:
   kubeturbo.io/controllable: "false"
@@ -40,6 +41,11 @@ restAPIConfig:
   opsManagerUserName: Turbo_username
   opsManagerPassword: Turbo_password
 
+# Turbo server registration process configuration
+sdkProtocolConfig:
+  registrationTimeoutSec: 300
+  restartOnRegistrationTimeout: false
+
 # For targetConfig, targetName provides better group naming to identify k8s clusters in UI
 # - If no targetConfig is specified, a default targetName will be created from the apiserver URL in
 #   the kubeconfig.
@@ -48,8 +54,8 @@ restAPIConfig:
 # - Specify a targetType only will register a probe without adding your cluster as a target.
 #   The probe will appear as a Cloud Native probe in the UI with a type Kubernetes-<targetType>.
 #
-#targetConfig:
-#  targetName: Cluster_Name
+targetConfig:
+  targetName: Cluster_Name
 #  targetType: Target_Type
 
 # In kubeturbo 6.4.3+, you can define what nodes should stay high-available based on the node role
@@ -83,6 +89,10 @@ HANodeConfig:
 #   GitopsApps: false (default: true)
 #   GoMemLimit: true (default: false)
 
+# Logging level. Changing this value does not require restart of Kubeturbo but takes about 1 minute to take effect
+logging:
+  level: 2
+
 args:
   # logging level
   logginglevel: 2
@@ -93,5 +103,9 @@ args:
   stitchuuid: true
   # if Kubernetes version is older than 1.6, then add another arg for move/resize action
   pre16k8sVersion: false
+  # cleanup the resources for scc impersonation by deault
+  cleanupSccImpersonationResources: true
+  # required for OCP cluster
+  # sccsupport: "*"
 
 resources: {}

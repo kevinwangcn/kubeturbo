@@ -8,8 +8,8 @@ import (
 	cadvisorapi "github.com/google/cadvisor/info/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/repository"
-	policyv1alpha1 "github.com/turbonomic/turbo-crd/api/v1alpha1"
 	gitopsv1alpha1 "github.com/turbonomic/turbo-gitops/api/v1alpha1"
+	policyv1alpha1 "github.com/turbonomic/turbo-policy/api/v1alpha1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -284,6 +284,7 @@ type MockClusterScrapper struct {
 	mockGetAllPVs                  func() ([]*v1.PersistentVolume, error)
 	mockGetAllPVCs                 func() ([]*v1.PersistentVolumeClaim, error)
 	mockGetAllTurboSLOScalings     func() ([]policyv1alpha1.SLOHorizontalScale, error)
+	mockGetAllTurboCVSScalings     func() ([]policyv1alpha1.ContainerVerticalScale, error)
 	mockGetAllTurboPolicyBindings  func() ([]policyv1alpha1.PolicyBinding, error)
 	mockGetAllGitOpsConfigurations func() ([]gitopsv1alpha1.GitOps, error)
 	mockUpdateGitOpsConfigCache    func()
@@ -294,6 +295,13 @@ func (s *MockClusterScrapper) GetAllTurboSLOScalings() ([]policyv1alpha1.SLOHori
 		return s.mockGetAllTurboSLOScalings()
 	}
 	return nil, fmt.Errorf("GetAllTurboSLOScalings Not implemented")
+}
+
+func (s *MockClusterScrapper) GetAllTurboCVSScalings() ([]policyv1alpha1.ContainerVerticalScale, error) {
+	if s.mockGetAllTurboCVSScalings != nil {
+		return s.mockGetAllTurboCVSScalings()
+	}
+	return nil, fmt.Errorf("GetAllTurboCVSScalings Not implemented")
 }
 
 func (s *MockClusterScrapper) GetAllTurboPolicyBindings() ([]policyv1alpha1.PolicyBinding, error) {

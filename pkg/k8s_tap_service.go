@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strings"
 
@@ -124,11 +123,11 @@ func loadOpsMgrCredentialsFromSecret(tapSpec *K8sTAPServiceSpec) error {
 		return nil
 	}
 
-	username, err := ioutil.ReadFile(usernameFilePath)
+	username, err := os.ReadFile(usernameFilePath)
 	if err != nil {
 		return fmt.Errorf("error reading server api credentials from secret: username: %v", err)
 	}
-	password, err := ioutil.ReadFile(passwordFilePath)
+	password, err := os.ReadFile(passwordFilePath)
 	if err != nil {
 		return fmt.Errorf("error reading server api credentials from secret: password: %v", err)
 	}
@@ -151,11 +150,11 @@ func loadClientIdSecretFromSecret(tapSpec *K8sTAPServiceSpec) error {
 		return nil
 	}
 
-	clientId, err := ioutil.ReadFile(clientIdFilePath)
+	clientId, err := os.ReadFile(clientIdFilePath)
 	if err != nil {
 		return fmt.Errorf("error reading secure server credentials from secret: clientId: %v", err)
 	}
-	clientSecret, err := ioutil.ReadFile(clientSecretFilePath)
+	clientSecret, err := os.ReadFile(clientSecretFilePath)
 	if err != nil {
 		return fmt.Errorf("error reading secure server credentials from secret: clientSecret: %v", err)
 	}
@@ -167,7 +166,7 @@ func loadClientIdSecretFromSecret(tapSpec *K8sTAPServiceSpec) error {
 }
 
 func readK8sTAPServiceSpec(path string) (*K8sTAPServiceSpec, error) {
-	file, e := ioutil.ReadFile(path)
+	file, e := os.ReadFile(path)
 	if e != nil {
 		return nil, fmt.Errorf("file error: %v" + e.Error())
 	}
@@ -190,7 +189,7 @@ func createProbeConfigOrDie(c *Config) *configs.ProbeConfig {
 
 	// Create cluster monitoring
 	clusterScraper := cluster.NewClusterScraper(c.RestConfig, c.KubeClient,
-		c.DynamicClient, c.ControllerRuntimeClient, c.clusterAPIEnabled, c.CAClient, c.CAPINamespace)
+		c.DynamicClient, c.ControllerRuntimeClient, c.OsClient, c.CAClient, c.CAPINamespace)
 	masterMonitoringConfig := master.NewClusterMonitorConfig(clusterScraper)
 
 	// TODO for now kubelet is the only monitoring source. As we have more sources, we should choose what to be added into the slice here.
@@ -218,15 +217,11 @@ func NewKubernetesTAPService(config *Config) (*K8sTAPService, error) {
 		return nil, errors.New("invalid K8sTAPServiceConfig")
 	}
 
-	// Create the configurations for the registration, discovery and action clients
-	registrationClientConfig := registration.NewRegistrationClientConfig(config.StitchingPropType, config.VMPriority,
-		config.VMIsBase, config.clusterAPIEnabled)
-
 	probeConfig := createProbeConfigOrDie(config)
 
 	discoveryClientConfig := discovery.NewDiscoveryConfig(probeConfig, config.tapSpec.K8sTargetConfig,
 		config.ValidationWorkers, config.ValidationTimeoutSec, config.containerUtilizationDataAggStrategy,
-		config.containerUsageDataAggStrategy, config.ORMClient, config.DiscoveryWorkers, config.DiscoveryTimeoutSec,
+		config.containerUsageDataAggStrategy, config.ORMClientManager, config.DiscoveryWorkers, config.DiscoveryTimeoutSec,
 		config.DiscoverySamples, config.DiscoverySampleIntervalSec, config.ItemsPerListQuery)
 
 	if config.clusterKeyInjected != "" {
@@ -237,8 +232,8 @@ func NewKubernetesTAPService(config *Config) (*K8sTAPService, error) {
 	if err != nil {
 		glog.Fatalf("Error retrieving the Kubernetes service id: %v", err)
 	}
-	actionHandlerConfig := action.NewActionHandlerConfig(config.CAPINamespace, config.CAClient, config.KubeletClient,
-		probeConfig.ClusterScraper, config.SccSupport, config.ORMClient, config.failVolumePodMoves,
+	actionHandlerConfig := action.NewActionHandlerConfig(config.CAPINamespace, config.KubeletClient,
+		probeConfig.ClusterScraper, config.SccSupport, config.ORMClientManager, config.failVolumePodMoves,
 		config.updateQuotaToAllowMoves, config.readinessRetryThreshold, config.gitConfig, k8sSvcId)
 
 	// Kubernetes Probe Discovery Client
@@ -249,6 +244,11 @@ func NewKubernetesTAPService(config *Config) (*K8sTAPService, error) {
 	actionHandler := action.NewActionHandler(actionHandlerConfig)
 
 	// Kubernetes Probe Registration Client
+	// Create the configurations for the registration, discovery and action clients
+	// TODO: Remove logic that checks ClusterAPI for action policies during probe registration when target level
+	//  action policy is implemented in the server
+	registrationClientConfig := registration.NewRegistrationClientConfig(config.StitchingPropType, config.VMPriority,
+		config.VMIsBase)
 	registrationClient := registration.NewK8sRegistrationClient(registrationClientConfig,
 		config.tapSpec.K8sTargetConfig, targetAccountValues.AccountValues(), k8sSvcId)
 
@@ -290,12 +290,11 @@ func NewKubernetesTAPService(config *Config) (*K8sTAPService, error) {
 		probeBuilder = probeBuilder.WithDiscoveryClient(discoveryClient)
 	}
 
-	tapService, err :=
-		service.NewTAPServiceBuilder().
-			WithCommunicationBindingChannel(k8sSvcId).
-			WithTurboCommunicator(config.tapSpec.TurboCommunicationConfig).
-			WithTurboProbe(probeBuilder). //Turbo Probe is Probe + Target
-			Create()
+	tapService, err := service.NewTAPServiceBuilder().
+		WithCommunicationBindingChannel(k8sSvcId).
+		WithTurboCommunicator(config.tapSpec.TurboCommunicationConfig).
+		WithTurboProbe(probeBuilder). // Turbo Probe is Probe + Target
+		Create()
 	if err != nil {
 		return nil, err
 	}

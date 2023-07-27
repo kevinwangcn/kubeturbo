@@ -14,12 +14,14 @@ import (
 	"time"
 
 	set "github.com/deckarep/golang-set"
+	"github.com/fsnotify/fsnotify"
 	"github.com/golang/glog"
+	osclient "github.com/openshift/client-go/apps/clientset/versioned"
 	clusterclient "github.com/openshift/machine-api-operator/pkg/generated/clientset/versioned"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/pflag"
+	"github.com/spf13/viper"
 	apiv1 "k8s.io/api/core/v1"
-	apiextclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/typed/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -39,7 +41,6 @@ import (
 	runtimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	kubeturbo "github.com/turbonomic/kubeturbo/pkg"
-	"github.com/turbonomic/kubeturbo/pkg/action/executor"
 	"github.com/turbonomic/kubeturbo/pkg/action/executor/gitops"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/processor"
 	nodeUtil "github.com/turbonomic/kubeturbo/pkg/discovery/util"
@@ -50,8 +51,8 @@ import (
 	"github.com/turbonomic/kubeturbo/pkg/resourcemapping"
 	"github.com/turbonomic/kubeturbo/pkg/util"
 	"github.com/turbonomic/kubeturbo/test/flag"
-	policyv1alpha1 "github.com/turbonomic/turbo-crd/api/v1alpha1"
 	gitopsv1alpha1 "github.com/turbonomic/turbo-gitops/api/v1alpha1"
+	policyv1alpha1 "github.com/turbonomic/turbo-policy/api/v1alpha1"
 )
 
 const (
@@ -73,7 +74,7 @@ const (
 )
 
 var (
-	defaultSccSupport = []string{"restricted"}
+	defaultSccSupport = []string{"*"}
 
 	// these variables will be deprecated. Keep it here for backward compatibility only
 	k8sVersion        = "1.8"
@@ -233,7 +234,7 @@ func (s *VMTServer) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&s.DiscoverySampleIntervalSec, "discovery-sample-interval", DefaultDiscoverySampleIntervalSec, "The discovery interval in seconds to collect additional resource usage data samples from kubelet. This should be no smaller than 10 seconds.")
 	fs.IntVar(&s.GCIntervalMin, "garbage-collection-interval", DefaultGCIntervalMin, "The garbage collection interval in minutes for possible leaked pods from actions failed because of kubeturbo restarts. Default value is 20 mins.")
 	fs.IntVar(&s.ItemsPerListQuery, "items-per-list-query", 0, "Number of workload controller items the list api call should request for.")
-	fs.StringSliceVar(&s.sccSupport, "scc-support", defaultSccSupport, "The SCC list allowed for executing pod actions, e.g., --scc-support=restricted,anyuid or --scc-support=* to allow all. Default allowed scc is [restricted].")
+	fs.StringSliceVar(&s.sccSupport, "scc-support", defaultSccSupport, "The SCC list allowed for executing pod actions, e.g., --scc-support=restricted,anyuid or --scc-support=* to allow all. Default allowed scc is [*].")
 	// So far we have noticed cluster api support only in openshift clusters and our implementation works only for openshift
 	// It thus makes sense to have openshifts machine api namespace as our default cluster api namespace
 	fs.StringVar(&s.ClusterAPINamespace, "cluster-api-namespace", "openshift-machine-api", "The Cluster API namespace.")
@@ -261,7 +262,8 @@ func createRecorder(kubecli *kubernetes.Clientset) record.EventRecorder {
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartLogging(glog.Infof)
 	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{
-		Interface: v1core.New(kubecli.CoreV1().RESTClient()).Events(apiv1.NamespaceAll)})
+		Interface: v1core.New(kubecli.CoreV1().RESTClient()).Events(apiv1.NamespaceAll),
+	})
 	// this EventRecorder can be used to send events to this EventBroadcaster
 	// with the given event source.
 	return eventBroadcaster.NewRecorder(scheme.Scheme, apiv1.EventSource{Component: "kubeturbo"})
@@ -290,8 +292,30 @@ func (s *VMTServer) createKubeClientOrDie(kubeConfig *restclient.Config) *kubern
 	return kubeClient
 }
 
+func (s *VMTServer) ensureBusyboxImageBackwardCompatibility() {
+	if s.CpuFrequencyGetterImage == "icr.io/cpopen/turbonomic/cpufreqgetter" && s.BusyboxImage != "busybox" {
+		// Somebody has set --busybox-image only explicitly, for example coming from an old configuration
+		// we should use it
+		s.CpuFrequencyGetterImage = s.BusyboxImage
+	}
+	// Other cases for example below, --cpufreqgetter-image value will always take precedence:
+	// if s.CpuFrequencyGetterImage == "icr.io/cpopen/turbonomic/cpufreqgetter" && s.BusyboxImage == "busybox"
+	// if s.CpuFrequencyGetterImage != "icr.io/cpopen/turbonomic/cpufreqgetter" && s.BusyboxImage != "busybox"
+	// if s.CpuFrequencyGetterImage == "icr.io/cpopen/turbonomic/cpufreqgetter" && s.BusyboxImage != "busybox"
+
+	if s.CpuFrequencyGetterPullSecret == "" && s.BusyboxImagePullSecret != "" {
+		// Somebody has set --busybox-image-pull-secret	only explicitly, for example coming from an old configuration
+		// we should use it
+		s.CpuFrequencyGetterPullSecret = s.BusyboxImagePullSecret
+	}
+	// Other cases for example below, --cpufreqgetter-image-pull-secret value will always take precedence:
+	// if s.CpuFrequencyGetterPullSecret != "" && s.BusyboxImagePullSecret != ""
+	// if s.CpuFrequencyGetterPullSecret != "" && s.BusyboxImagePullSecret == ""
+}
+
 func (s *VMTServer) CreateKubeletClientOrDie(kubeConfig *restclient.Config, fallbackClient *kubernetes.Clientset,
-	cpuFreqGetterImage, imagePullSecret string, cpufreqJobExcludeNodeLabels map[string]set.Set, useProxyEndpoint bool) *kubeclient.KubeletClient {
+	cpuFreqGetterImage, imagePullSecret string, cpufreqJobExcludeNodeLabels map[string]set.Set, useProxyEndpoint bool,
+) *kubeclient.KubeletClient {
 	kubeletClient, err := kubeclient.NewKubeletConfig(kubeConfig).
 		WithPort(s.KubeletPort).
 		EnableHttps(s.EnableKubeletHttps).
@@ -352,16 +376,16 @@ func (s *VMTServer) Run() {
 		glog.Fatalf("Failed to create controller runtime client: %v.", err)
 	}
 
+	// Openshift client for deploymentconfig resize forced rollouts
+	osClient, err := osclient.NewForConfig(kubeConfig)
+	if err != nil {
+		glog.Fatalf("Failed to generate openshift client for kubernetes target: %v", err)
+	}
+
 	// TODO: Replace dynamicClient with runtimeClient
 	dynamicClient, err := dynamic.NewForConfig(kubeConfig)
 	if err != nil {
 		glog.Fatalf("Failed to generate dynamic client for kubernetes target: %v", err)
-	}
-
-	// TODO: Replace apiExtClient with runtimeClient
-	apiExtClient, err := apiextclient.NewForConfig(kubeConfig)
-	if err != nil {
-		glog.Fatalf("Failed to generate apiExtensions client for kubernetes target: %v", err)
 	}
 
 	util.K8sAPIDeploymentGV, err = discoverk8sAPIResourceGV(kubeClient, util.DeploymentResName)
@@ -424,6 +448,8 @@ func (s *VMTServer) Run() {
 		glog.Fatalf("Invalid cpu frequency exclude node label selectors: %v. The selectors "+
 			"should be a comma saperated list of key=value node label pairs", err)
 	}
+
+	s.ensureBusyboxImageBackwardCompatibility()
 	kubeletClient := s.CreateKubeletClientOrDie(kubeConfig, kubeClient, s.CpuFrequencyGetterImage,
 		s.CpuFrequencyGetterPullSecret, excludeLabelsMap, s.UseNodeProxyEndpoint)
 	caClient, err := clusterclient.NewForConfig(kubeConfig)
@@ -432,8 +458,8 @@ func (s *VMTServer) Run() {
 		caClient = nil
 	}
 
-	ormClient := resourcemapping.NewORMClient(dynamicClient, apiExtClient)
-	clusterAPIEnabled := executor.IsClusterAPIEnabled(caClient, kubeClient)
+	// Interface to discover turbonomic ORM mappings (legacy and v2) for resize actions
+	ormClientManager := resourcemapping.NewORMClientManager(dynamicClient, kubeConfig)
 
 	// Configuration for creating the Kubeturbo TAP service
 	vmtConfig := kubeturbo.NewVMTConfig2()
@@ -442,9 +468,10 @@ func (s *VMTServer) Run() {
 		WithKubeConfig(kubeConfig).
 		WithDynamicClient(dynamicClient).
 		WithControllerRuntimeClient(runtimeClient).
-		WithORMClient(ormClient).
+		WithORMClientManager(ormClientManager).
 		WithKubeletClient(kubeletClient).
 		WithClusterAPIClient(caClient).
+		WithOpenshiftClient(osClient).
 		WithVMPriority(s.VMPriority).
 		WithVMIsBase(s.VMIsBase).
 		UsingUUIDStitch(s.UseUUID).
@@ -461,7 +488,6 @@ func (s *VMTServer) Run() {
 		WithContainerUsageDataAggStrategy(s.containerUsageDataAggStrategy).
 		WithVolumePodMoveConfig(s.FailVolumePodMoves).
 		WithQuotaUpdateConfig(s.UpdateQuotaToAllowMoves).
-		WithClusterAPIEnabled(clusterAPIEnabled).
 		WithReadinessRetryThreshold(s.readinessRetryThreshold).
 		WithClusterKeyInjected(s.ClusterKeyInjected).
 		WithItemsPerListQuery(s.ItemsPerListQuery)
@@ -719,11 +745,10 @@ func GetSCCs(client dynamic.Interface) (sccList *unstructured.UnstructuredList) 
 			var err error
 			sccList, err = client.Resource(res).List(context.TODO(), metav1.ListOptions{})
 			if err != nil {
-				glog.Errorf("Failed to get openshift cluster sccs: %v", err)
+				glog.Warningf("Could not get openshift cluster sccs: %v", err)
 			}
 			return err
 		})
-
 	if err != nil {
 		return nil
 	}
@@ -748,7 +773,6 @@ func createSCCServiceAccount(namespace, sccName string, kubeClient kubernetes.In
 				return err
 			}
 			return nil
-
 		})
 
 	return saName, err
@@ -943,7 +967,6 @@ func deleteSCCClusterRole(namespace string, kubeClient kubernetes.Interface) {
 			}
 			return nil
 		})
-
 	if err != nil {
 		glog.Errorf("Error deleting SCC cluster role. %v", err)
 	}
@@ -963,7 +986,6 @@ func deleteSCCClusterRoleBinding(namespace string, kubeClient kubernetes.Interfa
 			}
 			return nil
 		})
-
 	if err != nil {
 		glog.Errorf("Error deleting SCC cluster role binding. %v", err)
 	}
@@ -988,4 +1010,48 @@ func reviewSCCAccess(namespace string, kubeClient kubernetes.Interface) bool {
 	}
 
 	return true
+}
+
+func WatchConfigMap() {
+	//Check if the file /etc/kubeturbo/turbo-autoreload.config exists
+	autoReloadConfigFilePath := "/etc/kubeturbo"
+	autoReloadConfigFileName := "turbo-autoreload.config"
+
+	viper.AddConfigPath(autoReloadConfigFilePath)
+	viper.SetConfigType("json")
+	viper.SetConfigName(autoReloadConfigFileName)
+	for {
+		verr := viper.ReadInConfig()
+		if verr == nil {
+			break
+		} else {
+			glog.V(4).Infof("Can't read the autoreload config file %s/%s due to the error: %v, will retry in 3 seconds", autoReloadConfigFilePath, autoReloadConfigFileName, verr)
+			time.Sleep(30 * time.Second)
+		}
+	}
+
+	glog.V(1).Infof("Start watching the autoreload config file %s/%s", autoReloadConfigFilePath, autoReloadConfigFileName)
+	updateConfig := func() {
+		newLoggingLevel := viper.GetString("logging.level")
+		currentLoggingLevel := pflag.Lookup("v").Value.String()
+		if newLoggingLevel != currentLoggingLevel {
+			if newLogVInt, err := strconv.Atoi(newLoggingLevel); err != nil || newLogVInt < 0 {
+				glog.Errorf("Invalid log verbosity %v in the autoreload config file", newLoggingLevel)
+			} else {
+				err := pflag.Lookup("v").Value.Set(newLoggingLevel)
+				if err != nil {
+					glog.Errorf("Can't apply the new logging level setting due to the error:%v", err)
+				} else {
+					glog.V(1).Infof("Logging level is changed from %v to %v", currentLoggingLevel, newLoggingLevel)
+				}
+
+			}
+		}
+	}
+	updateConfig() //update the logging level during startup
+	viper.OnConfigChange(func(in fsnotify.Event) {
+		updateConfig()
+	})
+
+	viper.WatchConfig()
 }
