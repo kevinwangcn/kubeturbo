@@ -165,6 +165,7 @@ replace (
 )
 
 replace (
+	github.com/turbonomic/turbo-go-sdk => /opt/git/turbo-go-sdk
 	k8s.io/kube-openapi => k8s.io/kube-openapi v0.0.0-20211115234752-e816edb12b65
 	sigs.k8s.io/controller-runtime => sigs.k8s.io/controller-runtime v0.11.0
 )
