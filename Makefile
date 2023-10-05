@@ -1,3 +1,4 @@
+# update make file 1111
 OUTPUT_DIR=build
 SOURCE_DIRS=cmd pkg
 PACKAGES=go list ./... | grep -v /vendor | grep -v /out
